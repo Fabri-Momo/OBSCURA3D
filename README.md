@@ -11,6 +11,22 @@ Results can be exported as per-vertex colors (PLY) or baked into a UV
 texture (PNG). A shaded OpenGL viewer displays the result automatically
 after each computation.
 
+## Origin
+
+OBSCURA3D derives from the following publication (a copy,
+[`2021 jch.pdf`](2021%20jch.pdf), is included in this repository):
+
+> Rolland, T., Monna, F., Magail, J., Esin, Y., Navarro, N., Wilczek, J.,
+> Gantulga, J.-O., Chateau-Smith, C. (2021). *Documenting carved stones
+> from 3D models. Part II – Ambient occlusion to reveal carved parts.*
+> Journal of Cultural Heritage, 49, 28–37.
+> <https://doi.org/10.1016/j.culher.2021.03.006>
+
+The paper evaluates five algorithms for computing ambient occlusion and
+sky visibility on 3D models of carved stones (Mongolian deer stones) and
+shows that **volumetric obscurance gives the best results** for revealing
+carved figures. If you use OBSCURA3D in your research, please cite it.
+
 ## Compute backends
 
 Auto-detected in this order:
