@@ -4,6 +4,6 @@ Name=OBSCURA3D
 GenericName=Volumetric Obscurance
 Comment=Compute volumetric obscurance (VO / VOP / VON) on 3D meshes
 Exec=OBSCURA3D
-Icon=OBSCURA3D_512x512
+Icon=OBSCURA3D
 Terminal=false
 Categories=Graphics;Science;

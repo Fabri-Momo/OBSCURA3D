@@ -15,7 +15,7 @@ project_dir = SPECPATH
 
 datas = [
     (os.path.join(project_dir, 'obscura_kernels.py'), '.'),
-    (os.path.join(project_dir, 'OBSCURA3D_512x512.png'), '.'),
+    (os.path.join(project_dir, 'OBSCURA3D.png'), '.'),
 ]
 binaries = []
 hiddenimports = []
@@ -98,6 +98,19 @@ try:
 except ImportError:
     pass
 
+try:
+    import rtree
+    hiddenimports.append('rtree')
+    binaries += _collect_ext_libs(rtree)  # rtree/lib/spatialindex* (pip wheels)
+    # conda-forge ships spatialindex in $PREFIX/lib, outside the package
+    for _ld in (os.path.join(sys.prefix, 'lib'),
+                os.path.join(sys.prefix, 'Library', 'lib')):
+        if os.path.isdir(_ld):
+            binaries += [(os.path.join(_ld, f), 'rtree/lib')
+                         for f in os.listdir(_ld) if 'spatialindex' in f]
+except ImportError:
+    print("rtree not installed - trimesh proximity queries disabled in the build")
+
 a = Analysis(
     [os.path.join(project_dir, 'OBSCURA3D.py')],
     pathex=[project_dir],
@@ -114,7 +127,7 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-icon_path = os.path.join(project_dir, 'OBSCURA3D_512x512.png')
+icon_path = os.path.join(project_dir, 'OBSCURA3D.png')
 if not os.path.isfile(icon_path):
     icon_path = None
 

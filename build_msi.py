@@ -48,7 +48,7 @@ MSI_FILE = os.path.join(
     os.path.dirname(DIST_DIR), f"OBSCURA3D-{APP_VERSION}-win64.msi")
 
 ICON_FILE = os.path.join(PROJECT_DIR, "OBSCURA3D.ico")
-LOGO_PNG = os.path.join(PROJECT_DIR, "OBSCURA3D_512x512.png")
+LOGO_PNG = os.path.join(PROJECT_DIR, "OBSCURA3D.png")
 BANNER_BMP = os.path.join(BUILD_DIR, "banner.bmp")
 DIALOG_BMP = os.path.join(BUILD_DIR, "dialog.bmp")
 

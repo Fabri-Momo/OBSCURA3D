@@ -4,7 +4,7 @@ __pycache__/
 *.jpg
 *.jpeg
 *.png
-!OBSCURA3D_512x512.png
+!OBSCURA3D.png
 
 # Build artifacts
 build/

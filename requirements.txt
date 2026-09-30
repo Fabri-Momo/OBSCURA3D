@@ -1,6 +1,8 @@
 PyQt5>=5.15,<5.16
 numpy>=1.24,<3
 trimesh>=4.0
+scipy>=1.10
+rtree>=1.0
 pillow>=9.0
 warp-lang>=1.0
 open3d>=0.18

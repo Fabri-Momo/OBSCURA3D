@@ -794,17 +794,16 @@ def clean_mesh(mesh, log_fn=None, progress_fn=None):
         progress_fn(9)
     
     # 5. Detect and invert if needed (consistent orientation)
-    # Use the global winding number as an indicator
+    # Negative signed volume on a watertight mesh = inward-pointing normals.
     try:
-        wn = trimesh.proximity.winding_number(mesh, mesh.vertices.mean(axis=0))
-        if wn < 0:
+        if mesh.is_watertight and mesh.volume < 0:
             mesh.invert()
-            changes.append("mesh inverted (negative winding number)")
+            changes.append("mesh inverted (negative volume)")
             if log_fn:
-                log_fn("  • Mesh inverted (negative winding number)")
+                log_fn("  • Mesh inverted (negative volume)")
     except Exception:
         if log_fn:
-            log_fn("  • Orientation detection skipped (winding number failed)")
+            log_fn("  • Orientation detection skipped (volume failed)")
     
     # 6. Final consistency check
     if not mesh.is_watertight:
@@ -864,22 +863,47 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
     log_fn(f"Backend: {_BACKEND}  |  Mode: {vo_mode}")
 
     # --- Dispatch by backend ---
+    # Ordered fallback chain: a backend can fail on the target machine
+    # (missing CUDA toolkit, driver, or JIT toolchain) — degrade gracefully.
     _check_cancel()
+    if _BACKEND == "metal_hybrid":
+        log_fn("metal_hybrid is a reserved backend — routed to NumPy "
+               "(no Metal kernels in this build)")
     if _BACKEND in ("warp_cuda", "warp_cpu"):
-        vo = _compute_vo_warp(mesh, vertices, normals, local_offsets, radius,
-                              voxel_step, invert, log_fn, progress_fn, vo_mode,
-                              cancel_fn)
+        candidates = ["warp", "open3d", "numpy"]
     elif _BACKEND == "open3d":
-        vo = _compute_vo_open3d(mesh, vertices, normals, local_offsets, radius,
-                                voxel_step, invert, log_fn, progress_fn, vo_mode,
-                                cancel_fn)
+        candidates = ["open3d", "numpy"]
     else:
-        if _BACKEND == "metal_hybrid":
-            log_fn("metal_hybrid is a reserved backend — routed to NumPy "
-                   "(no Metal kernels in this build)")
-        vo = _compute_vo_numpy(mesh, vertices, normals, local_offsets, radius,
-                               voxel_step, invert, log_fn, progress_fn, vo_mode,
-                               cancel_fn)
+        candidates = ["numpy"]
+
+    vo = None
+    last_err = None
+    for cand in candidates:
+        if cand == "warp" and wp is None:
+            continue
+        if cand == "open3d" and not _O3D_OK:
+            continue
+        try:
+            if cand == "warp":
+                vo = _compute_vo_warp(mesh, vertices, normals, local_offsets,
+                                      radius, voxel_step, invert, log_fn,
+                                      progress_fn, vo_mode, cancel_fn)
+            elif cand == "open3d":
+                vo = _compute_vo_open3d(mesh, vertices, normals, local_offsets,
+                                        radius, voxel_step, invert, log_fn,
+                                        progress_fn, vo_mode, cancel_fn)
+            else:
+                vo = _compute_vo_numpy(mesh, vertices, normals, local_offsets,
+                                       radius, voxel_step, invert, log_fn,
+                                       progress_fn, vo_mode, cancel_fn)
+            break
+        except _Cancelled:
+            raise
+        except Exception as e:
+            last_err = e
+            log_fn(f"⚠ {cand} backend failed: {e} → falling back")
+    if vo is None:
+        raise RuntimeError(f"All compute backends failed (last: {last_err})")
 
     # --- Common post-processing ---
     _check_cancel()
@@ -1462,6 +1486,13 @@ if __name__ == "__main__":
               f"pyqtgraph={_PYQTGRAPH_OK} metal={_METAL_OK}")
         if not _NUMBA_OK:
             print(f"  numba err: {_NUMBA_ERR}")
+        # trimesh lazy deps used at runtime: scipy (merge_vertices),
+        # rtree (ProximityQuery / winding_number) - easy to miss in bundles
+        _tm = trimesh.creation.icosphere(subdivisions=1)
+        _tm.merge_vertices()
+        _sd = trimesh.proximity.signed_distance(
+            _tm, [_tm.vertices.mean(axis=0)])[0]
+        print(f"  trimesh proximity OK (signed_distance={_sd:.3f})")
         if wp is not None:
             # Actually launch a kernel: verifies inspect.getsource works
             # (JIT source access is broken in badly-packaged frozen builds)
@@ -1481,7 +1512,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("OBSCURA3D")
     app.setStyle("Fusion")
-    icon_file = "OBSCURA3D.ico" if sys.platform == "win32" else "OBSCURA3D_512x512.png"
+    icon_file = "OBSCURA3D.ico" if sys.platform == "win32" else "OBSCURA3D.png"
     icon_path = _resource_path(icon_file)
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
