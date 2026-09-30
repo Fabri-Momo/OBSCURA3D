@@ -1,18 +1,22 @@
 """
-vo_sdf_gui4.py — Volumetric Obscurance, cross-platform.
+OBSCURA3D — Volumetric Obscurance, cross-platform.
 
-Backend auto-détecté :
-  1. Warp CUDA  — Windows/Linux NVIDIA  (meilleur, identique à vo_sdf_gui.py)
-  2. Warp CPU   — Mac Apple Silicon / tout OS sans CUDA
-  3. Open3D     — fallback si Warp absent (RaycastingScene, multithreaded CPU)
-  4. NumPy      — fallback ultime si ni Warp ni Open3D
+Modes: VO (full sphere), VOP (positive hemisphere), VON (negative hemisphere).
 
-Installation Mac :  pip install warp-lang open3d
-Installation PC  :  pip install warp-lang   (CUDA auto-détecté)
+Auto-detected backend:
+  1. Warp CUDA  — Windows/Linux NVIDIA  (best)
+  2. Warp CPU   — Mac Apple Silicon / any OS without CUDA
+  3. Open3D     — fallback if Warp is missing (RaycastingScene, multithreaded CPU)
+  4. NumPy      — last resort if neither Warp nor Open3D
+  5. metal_hybrid — reserved slot for Apple Silicon GPU (opt-in: --backend metal_hybrid)
+
+Mac install :  pip install warp-lang open3d
+PC install  :  pip install warp-lang   (CUDA auto-detected)
 """
 
 import sys
 import os
+import platform
 import traceback
 import numpy as np
 import trimesh
@@ -34,17 +38,17 @@ try:
     _PYQTGRAPH_OK = True
 except ImportError:
     _PYQTGRAPH_OK = False
-    print("⚠ pyqtgraph non disponible → visualisation 3D désactivée")
+    print("WARNING: pyqtgraph not available -> 3D visualization disabled")
 
 
 # ---------------------------------------------------------------------------
-# Détection du backend disponible
+# Available backend detection
 # ---------------------------------------------------------------------------
 
-_BACKEND   = "numpy"   # sera mis à jour ci-dessous
+_BACKEND   = "numpy"   # updated below
 _WP_DEVICE = "cpu"
 
-# --backend warp_cuda|warp_cpu|open3d|numpy  pour forcer un backend
+# --backend warp_cuda|warp_cpu|open3d|numpy  to force a backend
 _FORCE_BACKEND = None
 for _i, _arg in enumerate(sys.argv[1:]):
     if _arg == "--backend" and _i + 1 < len(sys.argv) - 1:
@@ -73,12 +77,25 @@ except Exception:
 if _BACKEND == "numpy" and _O3D_OK:
     _BACKEND = "open3d"
 
-# Forcer le backend si demandé en ligne de commande
-if _FORCE_BACKEND in ("warp_cuda", "warp_cpu", "open3d", "numpy"):
+# metal_hybrid is a reserved backend: only relevant on Apple Silicon macOS
+# and only "available" when the metal_hybrid module is actually importable.
+_METAL_OK = False
+if platform.system() == "Darwin" and platform.machine() == "arm64":
+    try:
+        import metal_hybrid as _mh  # noqa: F401
+        _METAL_OK = True
+    except Exception:
+        _METAL_OK = False
+
+# Force the backend if requested on the command line
+if _FORCE_BACKEND in ("warp_cuda", "warp_cpu", "open3d", "numpy", "metal_hybrid"):
     if _FORCE_BACKEND in ("warp_cuda", "warp_cpu") and wp is None:
-        print(f"⚠ Warp non disponible, impossible de forcer {_FORCE_BACKEND}")
+        print(f"WARNING: Warp not available, cannot force {_FORCE_BACKEND}")
     elif _FORCE_BACKEND == "open3d" and not _O3D_OK:
-        print(f"⚠ Open3D non disponible, impossible de forcer open3d")
+        print("WARNING: Open3D not available, cannot force open3d")
+    elif _FORCE_BACKEND == "metal_hybrid" and not _METAL_OK:
+        print("WARNING: metal_hybrid is reserved for Apple Silicon macOS with "
+              "the metal-hybrid package installed — cannot force it")
     else:
         _BACKEND = _FORCE_BACKEND
         if _FORCE_BACKEND == "warp_cuda":   _WP_DEVICE = "cuda"
@@ -86,7 +103,7 @@ if _FORCE_BACKEND in ("warp_cuda", "warp_cpu", "open3d", "numpy"):
 
 
 # ---------------------------------------------------------------------------
-# Kernels Warp (définis seulement si Warp est disponible)
+# Warp kernels (defined only if Warp is available)
 # ---------------------------------------------------------------------------
 
 if wp is not None:
@@ -126,6 +143,10 @@ if wp is not None:
         offsets:    wp.array(dtype=wp.vec3),
         lin_out:    wp.array(dtype=wp.float32),
         lout_out:   wp.array(dtype=wp.float32),
+        lin_pos_out:  wp.array(dtype=wp.float32),
+        lout_pos_out: wp.array(dtype=wp.float32),
+        lin_neg_out:  wp.array(dtype=wp.float32),
+        lout_neg_out: wp.array(dtype=wp.float32),
         max_dist:   wp.float32,
         voxel_step: wp.float32,
         invert:     wp.int32,
@@ -140,37 +161,59 @@ if wp is not None:
         off = offsets[oid]
         q   = p + off[0] * t1 + off[1] * t2 + off[2] * n
         query = wp.mesh_query_point_sign_winding_number(mesh_id, q, max_dist)
-        is_inside = wp.int32(0)
+        inside = float(0.0)
         if query.result:
             closest     = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
             signed_dist = query.sign * wp.length(q - closest)
-            if signed_dist < 0.0:
-                is_inside = wp.int32(1)
+            inside = wp.clamp(0.5 - signed_dist / voxel_step, 0.0, 1.0)
         if invert != wp.int32(0):
-            is_inside = wp.int32(1) - is_inside
-        if is_inside == wp.int32(1):
-            wp.atomic_add(lin_out,  vid, voxel_step)
-        else:
-            wp.atomic_add(lout_out, vid, voxel_step)
+            inside = 1.0 - inside
+        outside = 1.0 - inside
+        inside_volume  = inside  * voxel_step
+        outside_volume = outside * voxel_step
+        wp.atomic_add(lin_out,  vid, inside_volume)
+        wp.atomic_add(lout_out, vid, outside_volume)
+        if off[2] >= 0.0:
+            wp.atomic_add(lin_pos_out,  vid, inside_volume)
+            wp.atomic_add(lout_pos_out, vid, outside_volume)
+        if off[2] <= 0.0:
+            wp.atomic_add(lin_neg_out,  vid, inside_volume)
+            wp.atomic_add(lout_neg_out, vid, outside_volume)
 
     @wp.kernel
     def _wp_vo_finalize(
-        lin_arr:   wp.array(dtype=wp.float32),
-        lout_arr:  wp.array(dtype=wp.float32),
-        valid_arr: wp.array(dtype=wp.int32),
-        vo_out:    wp.array(dtype=wp.float32),
+        lin_arr:      wp.array(dtype=wp.float32),
+        lout_arr:     wp.array(dtype=wp.float32),
+        lin_pos_arr:  wp.array(dtype=wp.float32),
+        lout_pos_arr: wp.array(dtype=wp.float32),
+        lin_neg_arr:  wp.array(dtype=wp.float32),
+        lout_neg_arr: wp.array(dtype=wp.float32),
+        valid_arr:    wp.array(dtype=wp.int32),
+        vo_out:       wp.array(dtype=wp.float32),
+        mode:         wp.int32,
     ):
         tid = wp.tid()
         if valid_arr[tid] == wp.int32(0):
             vo_out[tid] = float(-1.0)
             return
-        lin  = lin_arr[tid]
-        lout = lout_arr[tid]
-        vo_out[tid] = lout / lin if lin > 0.0 else float(-1.0)
+        if mode == wp.int32(0):
+            lin  = lin_arr[tid]
+            lout = lout_arr[tid]
+            vo_out[tid] = lout / lin if lin > 0.0 else float(-1.0)
+        elif mode == wp.int32(1):
+            lin   = lin_pos_arr[tid]
+            lout  = lout_pos_arr[tid]
+            total = lin + lout
+            vo_out[tid] = lout / total if total > 0.0 else float(-1.0)
+        else:
+            lin   = lin_neg_arr[tid]
+            lout  = lout_neg_arr[tid]
+            total = lin + lout
+            vo_out[tid] = lin / total if total > 0.0 else float(-1.0)
 
 
 # ---------------------------------------------------------------------------
-# Fonctions utilitaires communes
+# Shared utility functions
 # ---------------------------------------------------------------------------
 
 def fibonacci_disk(n, radius):
@@ -212,6 +255,33 @@ def build_tangent_frames_np(normals):
     return t1.astype(np.float32), t2.astype(np.float32), valid, n.astype(np.float32)
 
 
+def _fractional_inside(signed_distance, voxel_step, valid, invert=False):
+    inside = np.clip(0.5 - np.asarray(signed_distance) / voxel_step, 0.0, 1.0)
+    if invert:
+        inside = 1.0 - inside
+    return inside.astype(np.float32) * np.asarray(valid, dtype=np.float32)
+
+
+def _finalize_vo(lin, lout, lin_pos, lout_pos, lin_neg, lout_neg, valid, mode):
+    """Convert inside/outside accumulators into a per-vertex VO scalar.
+
+    mode: "vo" (full sphere), "vop" (positive hemisphere) or "von" (negative).
+    """
+    mode = str(mode).lower()
+    with np.errstate(invalid='ignore', divide='ignore'):
+        if mode == "vo":
+            vo = np.where((valid != 0) & (lin > 0.0), lout / lin, np.nan)
+        elif mode == "vop":
+            total_pos = lin_pos + lout_pos
+            vo = np.where((valid != 0) & (total_pos > 0.0), lout_pos / total_pos, np.nan)
+        elif mode == "von":
+            total_neg = lin_neg + lout_neg
+            vo = np.where((valid != 0) & (total_neg > 0.0), lin_neg / total_neg, np.nan)
+        else:
+            raise ValueError(f"Unknown vo_mode: {mode!r}")
+    return vo.astype(np.float32)
+
+
 try:
     import numba
     from numba import njit, prange
@@ -240,8 +310,8 @@ except Exception as _e:
 
 
 def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn=None):
-    """Rastérisation barycentrique — Numba JIT parallel si disponible, sinon numpy chunks.
-    Sans matplotlib/scipy. Fonctionne avec tous les layouts UV.
+    """Barycentric rasterization — Numba JIT parallel if available, else numpy chunks.
+    No matplotlib/scipy. Works with all UV layouts.
     """
     if isinstance(texture_size, tuple):
         tex_w, tex_h = int(texture_size[0]), int(texture_size[1])
@@ -255,9 +325,9 @@ def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn
              (uv1[:,1]-uv0[:,1])*(uv2[:,0]-uv0[:,0]))
     tri_idx = np.where(np.abs(cross) > 1e-10)[0]
     if log_fn:
-        log_fn(f"Triangles UV valides : {len(tri_idx)}/{len(faces)}")
+        log_fn(f"Valid UV triangles: {len(tri_idx)}/{len(faces)}")
 
-    # UV → pixels  (V inversé)
+    # UV → pixels  (V flipped)
     au = (uv0[tri_idx, 0] * (tex_w - 1)).astype(np.float32)
     av = ((1.0 - uv0[tri_idx, 1]) * (tex_h - 1)).astype(np.float32)
     bu = (uv1[tri_idx, 0] * (tex_w - 1)).astype(np.float32)
@@ -269,14 +339,14 @@ def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn
     v1 = vo_values_gray[faces[tri_idx, 1]].astype(np.float32)
     v2 = vo_values_gray[faces[tri_idx, 2]].astype(np.float32)
 
-    # Dénominateur barycentrique (F,)
+    # Barycentric denominator (F,)
     denom = (bv - cv)*(au - cu) + (cu - bu)*(av - cv)
     ok = np.abs(denom) > 1e-8
     tri_idx = tri_idx[ok]
     au=au[ok]; av=av[ok]; bu=bu[ok]; bv=bv[ok]; cu=cu[ok]; cv=cv[ok]
     v0=v0[ok]; v1=v1[ok]; v2=v2[ok]; denom=denom[ok]
 
-    # Bounding boxes entières de chaque triangle (F,)
+    # Integer bounding boxes of each triangle (F,)
     c0 = np.maximum(0,       np.floor(np.minimum(au, np.minimum(bu, cu))).astype(np.int32))
     c1 = np.minimum(tex_w-1, np.ceil( np.maximum(au, np.maximum(bu, cu))).astype(np.int32))
     r0 = np.maximum(0,       np.floor(np.minimum(av, np.minimum(bv, cv))).astype(np.int32))
@@ -286,16 +356,16 @@ def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn
     covered = np.zeros((tex_h, tex_w), dtype=np.uint8)
 
     if not _NUMBA_OK and log_fn:
-        log_fn(f"⚠ Numba indisponible ({_NUMBA_ERR}) → fallback numpy")
+        log_fn(f"⚠ Numba unavailable ({_NUMBA_ERR}) → numpy fallback")
 
     if _NUMBA_OK:
         import numba as _nb
         nthreads = _nb.get_num_threads()
         pixel_areas = (c1 - c0 + 1) * (r1 - r0 + 1)
-        if log_fn: log_fn(f"Méthode : Numba JIT parallel ({nthreads} threads) — "
-                          f"{len(denom):,} triangles, bbox moy={pixel_areas.mean():.1f}px², "
+        if log_fn: log_fn(f"Method: Numba JIT parallel ({nthreads} threads) — "
+                          f"{len(denom):,} triangles, avg bbox={pixel_areas.mean():.1f}px², "
                           f"max={pixel_areas.max()}px²")
-        # Forcer la contiguïté mémoire — requis par Numba parallel
+        # Force memory contiguity — required by Numba parallel
         au=np.ascontiguousarray(au); av=np.ascontiguousarray(av)
         bu=np.ascontiguousarray(bu); bv=np.ascontiguousarray(bv)
         cu=np.ascontiguousarray(cu); cv=np.ascontiguousarray(cv)
@@ -308,7 +378,7 @@ def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn
         result = np.clip(result, 0, 255).astype(np.uint8)
         fill_ratio = covered.astype(bool).mean()
         if log_fn:
-            log_fn(f"Texture générée ({fill_ratio*100:.1f}% couvert)")
+            log_fn(f"Texture generated ({fill_ratio*100:.1f}% covered)")
         return np.stack([result, result, result], axis=-1)
 
     # Fallback numpy chunks
@@ -317,31 +387,31 @@ def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn
     for start in range(0, F, CHUNK):
         end = min(start + CHUNK, F)
         sl  = slice(start, end)
-        C   = end - start   # nb triangles dans ce chunk
+        C   = end - start   # triangles in this chunk
 
-        # Largeur/hauteur bbox de chaque triangle
+        # Bbox width/height of each triangle
         bw = (c1[sl] - c0[sl] + 1)   # (C,)
         bh = (r1[sl] - r0[sl] + 1)
 
-        # Énumérer tous les pixels de chaque bbox : produit cartésien via repeat/tile
-        # pixel_count par triangle = bw * bh
+        # Enumerate all pixels of each bbox: cartesian product via repeat/tile
+        # pixel_count per triangle = bw * bh
         counts = bw * bh                          # (C,)
         total  = int(counts.sum())
         if total == 0:
             continue
 
-        # Indice triangle pour chaque pixel
+        # Triangle index for each pixel
         tri_rep = np.repeat(np.arange(C), counts)  # (total,)
 
-        # Coordonnées locales (dc, dr) dans chaque bbox
+        # Local coordinates (dc, dr) inside each bbox
         dc_all = np.concatenate([np.tile(np.arange(bw[i]), bh[i]) for i in range(C)])
         dr_all = np.concatenate([np.repeat(np.arange(bh[i]), bw[i]) for i in range(C)])
 
-        # Coordonnées pixel absolues
+        # Absolute pixel coordinates
         px = (c0[sl][tri_rep] + dc_all).astype(np.float32)
         py = (r0[sl][tri_rep] + dr_all).astype(np.float32)
 
-        # Barycentriques
+        # Barycentrics
         _au=au[sl][tri_rep]; _av=av[sl][tri_rep]
         _bu=bu[sl][tri_rep]; _bv=bv[sl][tri_rep]
         _cu=cu[sl][tri_rep]; _cv=cv[sl][tri_rep]
@@ -365,8 +435,8 @@ def rasterize_vo_to_texture(uv, faces, vo_values_gray, texture_size=2048, log_fn
     result = np.clip(result, 0, 255).astype(np.uint8)
     fill_ratio = covered.astype(bool).mean()
     if log_fn:
-        log_fn(f"Méthode : numpy chunks (barycentrique)")
-        log_fn(f"Texture générée ({fill_ratio*100:.1f}% couvert)")
+        log_fn(f"Method: numpy chunks (barycentric)")
+        log_fn(f"Texture generated ({fill_ratio*100:.1f}% covered)")
     return np.stack([result, result, result], axis=-1)
 
 
@@ -385,47 +455,60 @@ def _get_uv(mesh):
 
 
 # ---------------------------------------------------------------------------
-# Calcul VO — backend Warp
+# VO computation — Warp backend
 # ---------------------------------------------------------------------------
 
 def _compute_vo_warp(mesh, vertices, normals, local_offsets, radius,
-                     voxel_step, invert, log_fn, progress_fn):
+                     voxel_step, invert, log_fn, progress_fn, vo_mode="vo",
+                     cancel_fn=None):
     N = len(vertices)
     M = len(local_offsets)
     max_dist = radius * 3.0
     faces = np.asarray(mesh.faces).flatten().astype(np.int32)
+    mode_int = {"vo": 0, "vop": 1, "von": 2}.get(str(vo_mode).lower(), 0)
 
     wp_mesh = wp.Mesh(
         points=wp.array(vertices,  dtype=wp.vec3,  device=_WP_DEVICE),
         indices=wp.array(faces,    dtype=wp.int32, device=_WP_DEVICE),
     )
-    wp_verts   = wp.array(vertices,      dtype=wp.vec3,    device=_WP_DEVICE)
-    wp_norms   = wp.array(normals,       dtype=wp.vec3,    device=_WP_DEVICE)
-    wp_offsets = wp.array(local_offsets, dtype=wp.vec3,    device=_WP_DEVICE)
-    wp_t1      = wp.zeros(N, dtype=wp.vec3,    device=_WP_DEVICE)
-    wp_t2      = wp.zeros(N, dtype=wp.vec3,    device=_WP_DEVICE)
-    wp_valid   = wp.zeros(N, dtype=wp.int32,   device=_WP_DEVICE)
-    wp_lin     = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
-    wp_lout    = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
-    wp_vo      = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_verts    = wp.array(vertices,      dtype=wp.vec3,    device=_WP_DEVICE)
+    wp_norms    = wp.array(normals,       dtype=wp.vec3,    device=_WP_DEVICE)
+    wp_offsets  = wp.array(local_offsets, dtype=wp.vec3,    device=_WP_DEVICE)
+    wp_t1       = wp.zeros(N, dtype=wp.vec3,    device=_WP_DEVICE)
+    wp_t2       = wp.zeros(N, dtype=wp.vec3,    device=_WP_DEVICE)
+    wp_valid    = wp.zeros(N, dtype=wp.int32,   device=_WP_DEVICE)
+    wp_lin      = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_lout     = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_lin_pos  = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_lout_pos = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_lin_neg  = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_lout_neg = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
+    wp_vo       = wp.zeros(N, dtype=wp.float32, device=_WP_DEVICE)
 
     progress_fn(35)
     wp.launch(kernel=_wp_build_tangent_frames, dim=N,
               inputs=[wp_norms, wp_t1, wp_t2, wp_valid], device=_WP_DEVICE)
 
-    log_fn(f"Lancement kernel Warp {'CUDA GPU' if _WP_DEVICE == 'cuda' else 'CPU'} "
+    if cancel_fn is not None and cancel_fn():
+        raise _Cancelled()
+    log_fn(f"Launching Warp {'CUDA GPU' if _WP_DEVICE == 'cuda' else 'CPU'} kernel "
            f"({N} × {M} = {N*M:,} threads)…")
     wp.launch(kernel=_wp_vo_kernel, dim=(N, M),
               inputs=[
                   wp_mesh.id, wp_verts, wp_norms, wp_t1, wp_t2, wp_valid,
                   wp_offsets, wp_lin, wp_lout,
+                  wp_lin_pos, wp_lout_pos, wp_lin_neg, wp_lout_neg,
                   wp.float32(max_dist), wp.float32(voxel_step),
                   wp.int32(1 if invert else 0),
               ], device=_WP_DEVICE)
     wp.launch(kernel=_wp_vo_finalize, dim=N,
-              inputs=[wp_lin, wp_lout, wp_valid, wp_vo], device=_WP_DEVICE)
+              inputs=[wp_lin, wp_lout,
+                      wp_lin_pos, wp_lout_pos, wp_lin_neg, wp_lout_neg,
+                      wp_valid, wp_vo, wp.int32(mode_int)], device=_WP_DEVICE)
     wp.synchronize()
-    log_fn("Kernel Warp terminé.")
+    if cancel_fn is not None and cancel_fn():
+        raise _Cancelled()
+    log_fn("Warp kernel done.")
     progress_fn(80)
 
     vo = wp_vo.numpy()
@@ -434,37 +517,43 @@ def _compute_vo_warp(mesh, vertices, normals, local_offsets, radius,
 
 
 # ---------------------------------------------------------------------------
-# Calcul VO — backend Open3D (RaycastingScene, multithreaded CPU)
+# VO computation — Open3D backend (RaycastingScene, multithreaded CPU)
 # ---------------------------------------------------------------------------
 
 def _compute_vo_open3d(mesh, vertices, normals, local_offsets, radius,
-                       voxel_step, invert, log_fn, progress_fn):
+                       voxel_step, invert, log_fn, progress_fn, vo_mode="vo",
+                       cancel_fn=None):
     import open3d as o3d
     N = len(vertices)
     M = len(local_offsets)
 
-    log_fn("Backend : Open3D RaycastingScene (BVH exact, multithreaded CPU)")
+    log_fn("Backend: Open3D RaycastingScene (exact BVH, multithreaded CPU)")
 
-    # Construire la scène Open3D
+    # Build the Open3D scene
     verts_o3d = o3d.core.Tensor(vertices,             dtype=o3d.core.float32)
     faces_o3d = o3d.core.Tensor(
         np.asarray(mesh.faces, dtype=np.uint32),       dtype=o3d.core.uint32)
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(verts_o3d, faces_o3d)
-    log_fn(f"BVH Open3D construit ({len(mesh.faces):,} triangles).")
+    log_fn(f"Open3D BVH built ({len(mesh.faces):,} triangles).")
     progress_fn(35)
 
-    # Repères tangents numpy
+    # NumPy tangent frames
     t1, t2, valid, normals_n = build_tangent_frames_np(normals)
 
-    lin  = np.zeros(N, dtype=np.float32)
-    lout = np.zeros(N, dtype=np.float32)
+    lin      = np.zeros(N, dtype=np.float32)
+    lout     = np.zeros(N, dtype=np.float32)
+    lin_pos  = np.zeros(N, dtype=np.float32)
+    lout_pos = np.zeros(N, dtype=np.float32)
+    lin_neg  = np.zeros(N, dtype=np.float32)
+    lout_neg = np.zeros(N, dtype=np.float32)
 
-    log_fn(f"Calcul VO Open3D ({N} × {M} = {N*M:,} requêtes)…")
-    chunk = 500_000   # requêtes par batch pour éviter OOM
+    log_fn(f"Open3D VO computation ({N} × {M} = {N*M:,} queries)…")
+    chunk = 500_000   # queries per batch to avoid OOM
 
     all_q = []
     vid_list = []
+    oz_all = []
     for oid in range(M):
         ox, oy, oz = local_offsets[oid]
         qx = vertices[:,0] + ox*t1[:,0] + oy*t2[:,0] + oz*normals_n[:,0]
@@ -472,99 +561,179 @@ def _compute_vo_open3d(mesh, vertices, normals, local_offsets, radius,
         qz = vertices[:,2] + ox*t1[:,2] + oy*t2[:,2] + oz*normals_n[:,2]
         all_q.append(np.column_stack([qx, qy, qz]))
         vid_list.append(np.arange(N, dtype=np.int32))
+        oz_all.append(np.full(N, oz, dtype=np.float32))
 
-    all_q   = np.concatenate(all_q,   axis=0).astype(np.float32)  # (N*M, 3)
+    all_q   = np.concatenate(all_q,    axis=0).astype(np.float32)  # (N*M, 3)
     vid_all = np.concatenate(vid_list, axis=0)                     # (N*M,)
+    oz_all  = np.concatenate(oz_all,   axis=0)                     # (N*M,)
     total   = len(all_q)
 
     processed = 0
     while processed < total:
+        if cancel_fn is not None and cancel_fn():
+            raise _Cancelled()
         end = min(processed + chunk, total)
         q_batch = all_q[processed:end]
         v_batch = vid_all[processed:end]
+        oz      = oz_all[processed:end]
 
         q_t   = o3d.core.Tensor(q_batch, dtype=o3d.core.float32)
-        # compute_signed_distance utilise winding number → fonctionne sur meshes ouverts
+        # compute_signed_distance uses winding number → works on open meshes
         sd = scene.compute_signed_distance(q_t).numpy()   # (batch,)
 
-        inside = (sd < 0.0).astype(np.int32) * valid[v_batch]
-        if invert:
-            inside = (1 - inside) * valid[v_batch]
-        np.add.at(lin,  v_batch, inside.astype(np.float32)   * voxel_step)
-        np.add.at(lout, v_batch, (1-inside).astype(np.float32) * voxel_step * valid[v_batch])
+        valid_b = valid[v_batch].astype(np.float32)
+        inside  = _fractional_inside(sd, voxel_step, valid_b, invert)
+        outside = (1.0 - inside) * valid_b
+        pos = ((oz >= 0.0) & (valid_b > 0.0)).astype(np.float32)
+        neg = ((oz <= 0.0) & (valid_b > 0.0)).astype(np.float32)
+
+        np.add.at(lin,      v_batch, inside  * voxel_step)
+        np.add.at(lout,     v_batch, outside * voxel_step)
+        np.add.at(lin_pos,  v_batch, inside  * voxel_step * pos)
+        np.add.at(lout_pos, v_batch, outside * voxel_step * pos)
+        np.add.at(lin_neg,  v_batch, inside  * voxel_step * neg)
+        np.add.at(lout_neg, v_batch, outside * voxel_step * neg)
 
         processed = end
         pct = 35 + int(45 * processed / total)
         progress_fn(pct)
 
-    log_fn("Calcul Open3D terminé.")
+    log_fn("Open3D computation done.")
     progress_fn(80)
 
-    with np.errstate(invalid='ignore', divide='ignore'):
-        vo = np.where(lin > 0, lout / lin, np.nan)
-    return vo
+    return _finalize_vo(lin, lout, lin_pos, lout_pos, lin_neg, lout_neg, valid, vo_mode)
 
 
 # ---------------------------------------------------------------------------
-# Calcul VO — fallback numpy pur
+# VO computation — pure numpy fallback
 # ---------------------------------------------------------------------------
 
 def _compute_vo_numpy(mesh, vertices, normals, local_offsets, radius,
-                      voxel_step, invert, log_fn, progress_fn):
+                      voxel_step, invert, log_fn, progress_fn, vo_mode="vo",
+                      cancel_fn=None):
     N = len(vertices)
     M = len(local_offsets)
-    log_fn("Backend : NumPy CPU (fallback — lent)")
+    log_fn("Backend: NumPy CPU (fallback — slow)")
     t1, t2, valid, normals_n = build_tangent_frames_np(normals)
     prox = trimesh.proximity.ProximityQuery(mesh)
-    lin  = np.zeros(N, dtype=np.float32)
-    lout = np.zeros(N, dtype=np.float32)
+    lin      = np.zeros(N, dtype=np.float32)
+    lout     = np.zeros(N, dtype=np.float32)
+    lin_pos  = np.zeros(N, dtype=np.float32)
+    lout_pos = np.zeros(N, dtype=np.float32)
+    lin_neg  = np.zeros(N, dtype=np.float32)
+    lout_neg = np.zeros(N, dtype=np.float32)
     for oid in range(M):
+        if cancel_fn is not None and cancel_fn():
+            raise _Cancelled()
         ox, oy, oz = local_offsets[oid]
         qx = vertices[:,0] + ox*t1[:,0] + oy*t2[:,0] + oz*normals_n[:,0]
         qy = vertices[:,1] + ox*t1[:,1] + oy*t2[:,1] + oz*normals_n[:,1]
         qz = vertices[:,2] + ox*t1[:,2] + oy*t2[:,2] + oz*normals_n[:,2]
         q_pts = np.column_stack([qx, qy, qz])
-        _, _, face_idx = prox.on_surface(q_pts)
+        closest, distance, face_idx = prox.on_surface(q_pts)
         face_normals = np.asarray(mesh.face_normals)[face_idx]
-        closest, _, _ = prox.on_surface(q_pts)
         diff = q_pts - closest
         sign = np.sign(np.einsum('ij,ij->i', diff, face_normals))
-        inside = (sign < 0).astype(np.int32) * valid
-        if invert:
-            inside = (1 - inside) * valid
-        lin  += inside.astype(np.float32)   * voxel_step
-        lout += (1-inside).astype(np.float32) * voxel_step * valid
+        inside  = _fractional_inside(sign * distance, voxel_step, valid, invert)
+        outside = (1.0 - inside) * valid
+        pos = (oz >= 0.0).astype(np.float32) * valid
+        neg = (oz <= 0.0).astype(np.float32) * valid
+        lin      += inside  * voxel_step
+        lout     += outside * voxel_step
+        lin_pos  += inside  * voxel_step * pos
+        lout_pos += outside * voxel_step * pos
+        lin_neg  += inside  * voxel_step * neg
+        lout_neg += outside * voxel_step * neg
         progress_fn(35 + int(45 * oid / M))
     progress_fn(80)
-    with np.errstate(invalid='ignore', divide='ignore'):
-        vo = np.where(lin > 0, lout / lin, np.nan)
-    return vo
+    return _finalize_vo(lin, lout, lin_pos, lout_pos, lin_neg, lout_neg, valid, vo_mode)
 
 
 # ---------------------------------------------------------------------------
-# Fenêtre de visualisation 3D
+# 3D visualization window
 # ---------------------------------------------------------------------------
 
 if _PYQTGRAPH_OK:
+    def _reset_gl_shader_cache():
+        """Drop cached GL shader programs.
+
+        pyqtgraph caches compiled program handles globally (ShaderProgram.prog),
+        but those handles become invalid once a GLViewWidget's context is
+        destroyed (e.g. after the viewer window is closed).  Clearing the cache
+        forces recompilation in the next live context.
+        """
+        try:
+            from pyqtgraph.opengl import shaders as _pg_shaders
+            for _sp in list(_pg_shaders.ShaderProgram.names.values()):
+                _sp.prog = None
+        except Exception:
+            pass
+
+    def _make_headlight_shader():
+        """Brighter variant of pyqtgraph's 'shaded' program.
+
+        Key light comes from the camera (headlight) with a fill on back
+        faces, so the model stays readable from any angle.
+        """
+        import textwrap
+        from pyqtgraph.opengl.shaders import (
+            ShaderProgram, VertexShader, FragmentShader)
+        return ShaderProgram('obscura_headlight', [
+            VertexShader(textwrap.dedent("""
+                uniform mat4 u_mvp;
+                uniform mat3 u_normal;
+                attribute vec4 a_position;
+                attribute vec3 a_normal;
+                attribute vec4 a_color;
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    v_normal = normalize(u_normal * a_normal);
+                    v_color = a_color;
+                    gl_Position = u_mvp * a_position;
+                }
+            """)),
+            FragmentShader(textwrap.dedent("""
+                #ifdef GL_ES
+                precision mediump float;
+                #endif
+                varying vec4 v_color;
+                varying vec3 v_normal;
+                void main() {
+                    vec3 n = normalize(v_normal);
+                    float d = dot(n, normalize(vec3(0.4, 0.4, -1.0)));
+                    float p = d > 0.0 ? d : -d * 0.45;
+                    vec3 rgb = v_color.rgb * (0.35 + 0.65 * p);
+                    gl_FragColor = vec4(rgb, v_color.a);
+                }
+            """)),
+        ])
+
+    try:
+        _HEADLIGHT_SHADER = _make_headlight_shader()
+    except Exception:
+        _HEADLIGHT_SHADER = 'shaded'
+
     class MeshViewer3D(QMainWindow):
         def __init__(self, parent=None):
             super().__init__(parent)
-            self.setWindowTitle("Visualisation 3D du Mesh")
+            _reset_gl_shader_cache()
+            self.setWindowTitle("3D Mesh Viewer")
             self.setGeometry(100, 100, 800, 600)
             
-            # Widget central OpenGL
+            # Central OpenGL widget
             self.gl_widget = gl.GLViewWidget()
             self.setCentralWidget(self.gl_widget)
             
-            # Configuration de la caméra
+            # Camera setup
             self.gl_widget.setCameraPosition(distance=5, elevation=30, azimuth=45)
             
-            # Axes pour référence
+            # Reference axes
             self.gl_axis = gl.GLAxisItem()
             self.gl_axis.setSize(1, 1, 1)
             self.gl_widget.addItem(self.gl_axis)
             
-            # Grille au sol
+            # Ground grid
             self.gl_grid = gl.GLGridItem()
             self.gl_grid.scale(0.1, 0.1, 0.1)
             self.gl_widget.addItem(self.gl_grid)
@@ -573,88 +742,114 @@ if _PYQTGRAPH_OK:
             self.current_mesh = None
             
             # Instructions
-            self.statusBar().showMessage("Navigation : clic gauche = rotation | clic droit = pan | molette = zoom")
+            self.statusBar().showMessage("Navigation: left click = rotate | right click = pan | wheel = zoom")
         
         def load_mesh(self, mesh):
-            """Charger un mesh trimesh dans la vue 3D."""
+            """Load a trimesh mesh into the 3D view."""
             self.current_mesh = mesh
             
             # Debug info
             print(f"[DEBUG] Mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces")
             print(f"[DEBUG] Bounds: min={mesh.vertices.min(axis=0)}, max={mesh.vertices.max(axis=0)}")
             
-            # Supprimer l'ancien mesh s'il existe
+            # Remove the previous mesh if any
             if self.mesh_item is not None:
                 self.gl_widget.removeItem(self.mesh_item)
             
-            # Préparer les vertices et faces pour pyqtgraph
+            # Prepare vertices and faces for pyqtgraph
             vertices = mesh.vertices.astype(np.float32)
             faces = mesh.faces.astype(np.uint32)
-            
-            # Créer l'item mesh
-            self.mesh_item = gl.GLMeshItem(
-                vertexes=vertices,
-                faces=faces,
-                color=(0.7, 0.7, 0.7, 1.0),  # Gris clair
-                smooth=False,
-                computeNormals=True,
-                drawEdges=True,
-                edgeColor=(0.3, 0.3, 0.3, 1.0)  # Bords sombres
-            )
+
+            # Use baked vertex colors when present (e.g. exported VO result)
+            vcolors = None
+            vis = getattr(mesh, 'visual', None)
+            if hasattr(vis, 'vertex_colors') and vis.vertex_colors is not None:
+                vc = np.asarray(vis.vertex_colors)
+                if vc.shape[0] == len(vertices) and vc.shape[1] >= 3:
+                    vcolors = vc.astype(np.float32) / 255.0
+
+            # Create the mesh item — shaded surface (point cloud fallback)
+            if len(faces) > 0:
+                mesh_kwargs = dict(
+                    vertexes=vertices,
+                    faces=faces,
+                    smooth=True,
+                    computeNormals=True,
+                    shader=_HEADLIGHT_SHADER,
+                    drawEdges=False,
+                )
+                if vcolors is not None:
+                    mesh_kwargs['vertexColors'] = vcolors
+                else:
+                    mesh_kwargs['color'] = (0.75, 0.75, 0.78, 1.0)  # Light gray
+                self.mesh_item = gl.GLMeshItem(**mesh_kwargs)
+            else:
+                self.mesh_item = gl.GLScatterPlotItem(
+                    pos=vertices,
+                    size=2.0,
+                    color=vcolors if vcolors is not None else (0.75, 0.75, 0.78, 1.0),  # Light gray
+                    pxMode=True,
+                )
             
             self.gl_widget.addItem(self.mesh_item)
             
-            # Centrer la vue sur le mesh
+            # Center the view on the mesh
             self.center_view()
             
-            # Debug caméra
+            # Debug camera
             bbox = mesh.bounding_box
             print(f"[DEBUG] Center: {bbox.centroid}, Extents: {bbox.extents}")
         
         def center_view(self):
-            """Centrer la caméra sur le mesh."""
+            """Center the camera on the mesh."""
             if self.current_mesh is None:
                 return
             
-            # Calculer le centre et la taille du mesh
+            # Compute mesh center and size
             center = self.current_mesh.bounding_box.centroid
             extents = self.current_mesh.bounding_box.extents
             
-            # Distance de caméra basée sur la taille du mesh
+            # Camera distance based on mesh size
             max_extent = np.max(extents)
             if max_extent < 1e-6:
-                max_extent = 1.0  # Éviter distance = 0 pour mesh tiny
+                max_extent = 1.0  # Avoid distance = 0 for a tiny mesh
             distance = max_extent * 3.0
             
-            # Positionner la caméra (center n'est pas supporté dans cette version)
+            # Position the camera (center is not supported in this version)
             self.gl_widget.setCameraPosition(
                 distance=distance,
                 elevation=30,
                 azimuth=45
             )
-            # Alternative: déplacer le mesh vers l'origine pour la visualisation
+            # Alternative: move the mesh to the origin for visualization
             if self.mesh_item is not None:
                 self.mesh_item.translate(-center[0], -center[1], -center[2])
             
-            # Ajuster aussi la grille et axes à l'échelle
+            # Also scale the grid and axes
             scale = max_extent * 0.5
             self.gl_axis.setSize(scale, scale, scale)
             self.gl_grid.scale(scale/10, scale/10, scale/10)
         
         def keyPressEvent(self, event):
-            """Raccourcis clavier."""
+            """Keyboard shortcuts."""
             if event.key() == Qt.Key_R:
                 self.center_view()
             elif event.key() == Qt.Key_Escape:
                 self.close()
 
+        def closeEvent(self, event):
+            # Hide instead of destroying: keeps the GL context alive so the
+            # cached shader programs stay valid when the window is reopened.
+            event.ignore()
+            self.hide()
+
 
 # ---------------------------------------------------------------------------
-# Fonction principale
+# Main function
 # ---------------------------------------------------------------------------
 
 def clean_mesh(mesh, log_fn=None, progress_fn=None):
-    """Nettoyage robuste du mesh : normales, doublons, dégénérés."""
+    """Robust mesh cleanup: normals, duplicates, degenerate faces."""
     changes = []
     original_v = len(mesh.vertices)
     original_f = len(mesh.faces)
@@ -662,87 +857,96 @@ def clean_mesh(mesh, log_fn=None, progress_fn=None):
     if progress_fn:
         progress_fn(2)
     
-    # 1. Supprimer les vertices non référencés
+    # 1. Remove unreferenced vertices
     mesh.remove_unreferenced_vertices()
     if len(mesh.vertices) != original_v:
         changes.append(f"vertices {original_v}→{len(mesh.vertices)}")
         if log_fn:
-            log_fn(f"  • Vertices non référencés supprimés ({original_v}→{len(mesh.vertices)})")
+            log_fn(f"  • Unreferenced vertices removed ({original_v}→{len(mesh.vertices)})")
     
     if progress_fn:
         progress_fn(4)
     
-    # 2. Supprimer les faces dégénérées (surface nulle)
+    # 2. Remove degenerate faces (zero area)
     non_degenerate = mesh.area_faces > 1e-12
     if not non_degenerate.all():
         mesh.update_faces(non_degenerate)
-        changes.append(f"faces dégénérées supprimées")
+        changes.append(f"degenerate faces removed")
         if log_fn:
-            log_fn(f"  • Faces dégénérées supprimées ({(~non_degenerate).sum()} faces)")
+            log_fn(f"  • Degenerate faces removed ({(~non_degenerate).sum()} faces)")
     
     if progress_fn:
         progress_fn(6)
     
-    # 3. Fusionner les vertices dupliqués (tolérance 1e-8)
-    # mesh.merge_vertices() gère automatiquement la détection
+    # 3. Merge duplicate vertices (tolerance 1e-8)
+    # mesh.merge_vertices() handles detection automatically
     mesh.merge_vertices()
-    changes.append("vertices dupliqués fusionnés")
+    changes.append("duplicate vertices merged")
     if log_fn:
-        log_fn("  • Vertices dupliqués fusionnés")
+        log_fn("  • Duplicate vertices merged")
     
     if progress_fn:
         progress_fn(8)
     
-    # 4. Recalculer les normales (plus fiable que les normales importées)
+    # 4. Recompute normals (more reliable than imported normals)
     mesh.fix_normals()
-    # Forcer le recalcul en vidant les caches
+    # Force recomputation by clearing the caches
     mesh.face_normals = None
     mesh.vertex_normals = None
-    changes.append("normales recalculées")
+    changes.append("normals recomputed")
     if log_fn:
-        log_fn("  • Normales recalculées")
+        log_fn("  • Normals recomputed")
     
     if progress_fn:
         progress_fn(9)
     
-    # 5. Détecter et inverser si nécessaire (orientation cohérente)
-    # Utiliser le winding number global comme indicateur
+    # 5. Detect and invert if needed (consistent orientation)
+    # Use the global winding number as an indicator
     try:
         wn = trimesh.proximity.winding_number(mesh, mesh.vertices.mean(axis=0))
         if wn < 0:
             mesh.invert()
-            changes.append("mesh inversé (winding number négatif)")
+            changes.append("mesh inverted (negative winding number)")
             if log_fn:
-                log_fn("  • Mesh inversé (winding number négatif)")
+                log_fn("  • Mesh inverted (negative winding number)")
     except Exception:
         if log_fn:
-            log_fn("  • Détection orientation ignorée (échec winding number)")
+            log_fn("  • Orientation detection skipped (winding number failed)")
     
-    # 6. Vérifier la cohérence finale
+    # 6. Final consistency check
     if not mesh.is_watertight:
         changes.append("⚠ mesh non-watertight")
         if log_fn:
-            log_fn("  • ⚠ Mesh non-watertight (OK pour VO)")
-    # mesh.fix_inconsistent_faces() n'existe pas dans trimesh, on saute cette étape
+            log_fn("  • ⚠ Non-watertight mesh (OK for VO)")
+    # mesh.fix_inconsistent_faces() doesn't exist in trimesh, skip this step
     
     if log_fn and changes:
-        log_fn(f"Nettoyage terminé : {len(changes)} corrections → {', '.join(changes)}")
+        log_fn(f"Cleanup done: {len(changes)} fixes → {', '.join(changes)}")
     
     return mesh
 
 
 def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
-                   export_mode, texture_size, texture_format, log_fn, progress_fn):
+                   export_mode, texture_size, texture_format, log_fn, progress_fn,
+                   vo_mode="vo", cancel_fn=None):
+
+    def _check_cancel():
+        if cancel_fn is not None and cancel_fn():
+            raise _Cancelled()
+
+    vo_mode = str(vo_mode).lower()
+    if vo_mode not in ("vo", "vop", "von"):
+        raise ValueError(f"vo_mode must be 'vo', 'vop' or 'von', got {vo_mode!r}")
     progress_fn(0)
     mesh = trimesh.load_mesh(input_mesh, process=False)
     
     if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError("Le fichier n'est pas un maillage triangulaire simple.")
+        raise ValueError("The file is not a simple triangular mesh.")
     
-    # Nettoyage systématique
+    # Systematic cleanup
     mesh = clean_mesh(mesh, log_fn, progress_fn)
     if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError("Le fichier n'est pas un maillage triangulaire simple.")
+        raise ValueError("The file is not a simple triangular mesh.")
 
     if export_mode == "texture_uv":
         uv_raw = _get_uv(mesh)
@@ -751,7 +955,7 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
         mesh.remove_unreferenced_vertices()
 
     if not mesh.is_watertight:
-        log_fn("⚠ Maillage non fermé (OK, winding number fonctionne quand même).")
+        log_fn("⚠ Mesh not closed (OK, winding number still works).")
 
     progress_fn(10)
     vertices = np.asarray(mesh.vertices,      dtype=np.float32)
@@ -763,33 +967,41 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
     M = len(local_offsets)
 
     progress_fn(20)
-    log_fn(f"Sommets : {N}  |  Offsets/sommet : {M}  |  Total : {N*M:,}")
-    log_fn(f"Backend : {_BACKEND}")
+    log_fn(f"Vertices: {N}  |  Offsets/vertex: {M}  |  Total: {N*M:,}")
+    log_fn(f"Backend: {_BACKEND}  |  Mode: {vo_mode}")
 
-    # --- Dispatch selon backend ---
+    # --- Dispatch by backend ---
+    _check_cancel()
     if _BACKEND in ("warp_cuda", "warp_cpu"):
         vo = _compute_vo_warp(mesh, vertices, normals, local_offsets, radius,
-                              voxel_step, invert, log_fn, progress_fn)
+                              voxel_step, invert, log_fn, progress_fn, vo_mode,
+                              cancel_fn)
     elif _BACKEND == "open3d":
         vo = _compute_vo_open3d(mesh, vertices, normals, local_offsets, radius,
-                                voxel_step, invert, log_fn, progress_fn)
+                                voxel_step, invert, log_fn, progress_fn, vo_mode,
+                                cancel_fn)
     else:
+        if _BACKEND == "metal_hybrid":
+            log_fn("metal_hybrid is a reserved backend — routed to NumPy "
+                   "(no Metal kernels in this build)")
         vo = _compute_vo_numpy(mesh, vertices, normals, local_offsets, radius,
-                               voxel_step, invert, log_fn, progress_fn)
+                               voxel_step, invert, log_fn, progress_fn, vo_mode,
+                               cancel_fn)
 
-    # --- Post-traitement commun ---
+    # --- Common post-processing ---
+    _check_cancel()
     finite = np.isfinite(vo)
     if finite.sum() == 0:
-        raise RuntimeError("Aucune valeur VO valide calculée.")
+        raise RuntimeError("No valid VO value computed.")
 
     lo, hi = np.nanpercentile(vo[finite], [2, 98])
-    log_fn(f"VO brut  : min={vo[finite].min():.4f}  max={vo[finite].max():.4f}  "
+    log_fn(f"Raw VO   : min={vo[finite].min():.4f}  max={vo[finite].max():.4f}  "
            f"std={vo[finite].std():.4f}  valid={finite.sum()}/{N}")
-    log_fn(f"Normalisation : p2={lo:.4f}  p98={hi:.4f}")
+    log_fn(f"Normalization: p2={lo:.4f}  p98={hi:.4f}")
 
     gray = np.zeros(N, dtype=np.uint8)
     if hi - lo < 1e-6:
-        log_fn("⚠ Plage VO quasi nulle !")
+        log_fn("⚠ VO range nearly zero!")
         gray[finite] = 128
     else:
         gray[finite] = np.clip(255*(vo[finite]-lo)/(hi-lo), 0, 255).astype(np.uint8)
@@ -801,11 +1013,11 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
         mesh.visual = trimesh.visual.ColorVisuals(mesh=mesh, vertex_colors=colors)
         mesh.export(output_mesh)
         progress_fn(100)
-        log_fn(f"✔ Maillage exporté (vertex colors) : {output_mesh}")
+        log_fn(f"✔ Mesh exported (vertex colors): {output_mesh}")
     else:
         texture_path = output_mesh
         if uv_raw is None:
-            log_fn("⚠ Pas d'UVs — projection cylindrique")
+            log_fn("⚠ No UVs — cylindrical projection")
             centered = vertices - vertices.mean(axis=0)
             theta    = np.arctan2(centered[:,2], centered[:,0])
             u_c = theta/(2*np.pi) + 0.5
@@ -813,19 +1025,19 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
             uv = np.column_stack([u_c, v_c])
         else:
             uv = uv_raw
-            log_fn(f"UVs : {uv.shape[0]} pts")
+            log_fn(f"UVs: {uv.shape[0]} pts")
         if uv.shape[0] != N:
-            raise RuntimeError(f"Incohérence UVs : {uv.shape[0]} vs {N} vertices.")
+            raise RuntimeError(f"UV mismatch: {uv.shape[0]} vs {N} vertices.")
         uv = uv.copy()
-        log_fn(f"UV bruts : U=[{uv[:,0].min():.4f}, {uv[:,0].max():.4f}]  "
+        log_fn(f"Raw UVs: U=[{uv[:,0].min():.4f}, {uv[:,0].max():.4f}]  "
                f"V=[{uv[:,1].min():.4f}, {uv[:,1].max():.4f}]")
-        # Ne normaliser que si les UVs sont hors [0,1] — sinon conserver l'échelle originale
+        # Only normalize if UVs are outside [0,1] — otherwise keep the original scale
         for i in range(2):
             mn, mx = uv[:,i].min(), uv[:,i].max()
             r = mx - mn
             if r > 1e-6 and (mn < -0.01 or mx > 1.01):
                 uv[:,i] = (uv[:,i] - mn) / r
-                log_fn(f"UV axe {i} renormalisé [{mn:.3f},{mx:.3f}] → [0,1]")
+                log_fn(f"UV axis {i} renormalized [{mn:.3f},{mx:.3f}] → [0,1]")
         progress_fn(90)
         texture_img = rasterize_vo_to_texture(uv, mesh.faces, gray, texture_size, log_fn)
         pil_img = Image.fromarray(texture_img)
@@ -835,8 +1047,8 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
             pil_img.save(texture_path, "JPEG", quality=95)
         _sz = (f"{texture_size[0]}x{texture_size[1]}" if isinstance(texture_size, tuple)
                else f"{texture_size}x{texture_size}")
-        log_fn(f"✔ Texture VO exportée ({_sz}) : {os.path.basename(texture_path)}")
-        log_fn("ℹ Appliquez cette texture à votre modèle original dans Blender/votre logiciel 3D.")
+        log_fn(f"✔ VO texture exported ({_sz}): {os.path.basename(texture_path)}")
+        log_fn("ℹ Apply this texture to your original model in Blender/your 3D software.")
         progress_fn(100)
 
 
@@ -844,15 +1056,22 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
 # Worker thread
 # ---------------------------------------------------------------------------
 
+class _Cancelled(Exception):
+    """Raised inside compute_vo_sdf when the user requests cancellation."""
+    pass
+
+
 class Worker(QObject):
     log      = pyqtSignal(str)
     progress = pyqtSignal(int)
     finished = pyqtSignal()
     error    = pyqtSignal(str)
+    cancelled = pyqtSignal()
 
     def __init__(self, input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
-                 export_mode, texture_size, texture_format):
+                 export_mode, texture_size, texture_format, vo_mode="vo"):
         super().__init__()
+        self._cancelled    = False
         self.input_mesh    = input_mesh
         self.output_mesh   = output_mesh
         self.radius        = radius
@@ -862,6 +1081,10 @@ class Worker(QObject):
         self.export_mode   = export_mode
         self.texture_size  = texture_size
         self.texture_format = texture_format
+        self.vo_mode       = vo_mode
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
@@ -870,20 +1093,24 @@ class Worker(QObject):
                 self.radius, self.voxel_step, self.n_disk, self.invert,
                 self.export_mode, self.texture_size, self.texture_format,
                 log_fn=self.log.emit, progress_fn=self.progress.emit,
+                vo_mode=self.vo_mode,
+                cancel_fn=lambda: self._cancelled,
             )
             self.finished.emit()
+        except _Cancelled:
+            self.cancelled.emit()
         except Exception:
             self.error.emit(traceback.format_exc())
 
 
 # ---------------------------------------------------------------------------
-# Main window  (identique à vo_sdf_gui.py)
+# Main window
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("VO-SDF v4 — Cross-platform")
+        self.setWindowTitle("OBSCURA3D")
         self.setMinimumSize(680, 580)
         self._thread = None
         self._worker = None
@@ -893,22 +1120,22 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         mb = self.menuBar()
-        file_menu = mb.addMenu("&Fichier")
-        open_act = QAction("&Ouvrir maillage…", self)
+        file_menu = mb.addMenu("&File")
+        open_act = QAction("&Open mesh…", self)
         open_act.setShortcut("Ctrl+O")
         open_act.triggered.connect(self._browse_input)
         file_menu.addAction(open_act)
-        save_act = QAction("Définir &sortie…", self)
+        save_act = QAction("Set &output…", self)
         save_act.setShortcut("Ctrl+S")
         save_act.triggered.connect(self._browse_output)
         file_menu.addAction(save_act)
         file_menu.addSeparator()
-        quit_act = QAction("&Quitter", self)
+        quit_act = QAction("&Quit", self)
         quit_act.setShortcut("Ctrl+Q")
         quit_act.triggered.connect(self.close)
         file_menu.addAction(quit_act)
-        help_menu = mb.addMenu("&Aide")
-        about_act = QAction("À &propos…", self)
+        help_menu = mb.addMenu("&Help")
+        about_act = QAction("&About…", self)
         about_act.triggered.connect(self._about)
         help_menu.addAction(about_act)
 
@@ -921,10 +1148,11 @@ class MainWindow(QMainWindow):
 
         # Backend info banner
         backend_labels = {
-            "warp_cuda": "🟢 Backend : Warp CUDA GPU",
-            "warp_cpu":  "🟡 Backend : Warp CPU (pas de GPU CUDA détecté)",
-            "open3d":    "🟡 Backend : Open3D CPU (Warp absent)",
-            "numpy":     "🔴 Backend : NumPy CPU (lent — installer warp-lang ou open3d)",
+            "warp_cuda": "🟢 Backend: Warp CUDA GPU",
+            "warp_cpu":  "🟡 Backend: Warp CPU (no CUDA GPU detected)",
+            "open3d":    "🟡 Backend: Open3D CPU (Warp missing)",
+            "metal_hybrid": "🟡 Backend: metal_hybrid (reserved — routed to NumPy)",
+            "numpy":     "🔴 Backend: NumPy CPU (slow — install warp-lang or open3d)",
         }
         banner = QLabel(backend_labels.get(_BACKEND, _BACKEND))
         banner.setStyleSheet("padding: 4px 8px; border-radius: 4px; "
@@ -932,35 +1160,35 @@ class MainWindow(QMainWindow):
         root.addWidget(banner)
 
         # Files group
-        files_box = QGroupBox("Fichiers")
+        files_box = QGroupBox("Files")
         files_layout = QVBoxLayout(files_box)
         in_row = QHBoxLayout()
-        in_row.addWidget(QLabel("Entrée :"))
+        in_row.addWidget(QLabel("Input:"))
         self.input_edit = QLineEdit()
-        self.input_edit.setPlaceholderText("Sélectionner un maillage (.ply, .obj, .stl…)")
+        self.input_edit.setPlaceholderText("Select a mesh (.ply, .obj, .stl…)")
         in_row.addWidget(self.input_edit)
-        btn_in = QPushButton("Parcourir…")
+        btn_in = QPushButton("Browse…")
         btn_in.clicked.connect(self._browse_input)
         in_row.addWidget(btn_in)
         files_layout.addLayout(in_row)
         out_row = QHBoxLayout()
-        self.output_label = QLabel("Sortie :  ")
+        self.output_label = QLabel("Output: ")
         out_row.addWidget(self.output_label)
         self.output_edit = QLineEdit()
-        self.output_edit.setPlaceholderText("Fichier de sortie (.ply)")
+        self.output_edit.setPlaceholderText("Output file (.ply)")
         out_row.addWidget(self.output_edit)
-        btn_out = QPushButton("Parcourir…")
+        btn_out = QPushButton("Browse…")
         btn_out.clicked.connect(self._browse_output)
         out_row.addWidget(btn_out)
         files_layout.addLayout(out_row)
         
         # 3D Viewer button
         viewer_row = QHBoxLayout()
-        self.btn_viewer = QPushButton("Visualiser 3D")
+        self.btn_viewer = QPushButton("View 3D")
         self.btn_viewer.setEnabled(False)
         self.btn_viewer.clicked.connect(self._open_3d_viewer)
         if not _PYQTGRAPH_OK:
-            self.btn_viewer.setText("Visualiser 3D (pyqtgraph requis)")
+            self.btn_viewer.setText("View 3D (pyqtgraph required)")
             self.btn_viewer.setEnabled(False)
         viewer_row.addWidget(self.btn_viewer)
         viewer_row.addStretch()
@@ -969,21 +1197,21 @@ class MainWindow(QMainWindow):
         root.addWidget(files_box)
 
         # Settings group
-        settings_box = QGroupBox("Paramètres")
+        settings_box = QGroupBox("Settings")
         settings_layout = QHBoxLayout(settings_box)
         settings_layout.setSpacing(20)
         v1 = QVBoxLayout()
-        v1.addWidget(QLabel("Rayon (m)"))
+        v1.addWidget(QLabel("Radius (m)"))
         self.spin_radius = QDoubleSpinBox()
         self.spin_radius.setRange(0.0001, 100.0)
         self.spin_radius.setDecimals(4)
         self.spin_radius.setSingleStep(0.005)
         self.spin_radius.setValue(0.01)
-        self.spin_radius.setToolTip("Rayon local de la sphère d'obscurance.")
+        self.spin_radius.setToolTip("Local radius of the obscurance sphere.")
         v1.addWidget(self.spin_radius)
         settings_layout.addLayout(v1)
         v2 = QVBoxLayout()
-        v2.addWidget(QLabel("Pas (m)"))
+        v2.addWidget(QLabel("Step (m)"))
         self.spin_step = QDoubleSpinBox()
         self.spin_step.setRange(0.00001, 10.0)
         self.spin_step.setDecimals(5)
@@ -992,7 +1220,7 @@ class MainWindow(QMainWindow):
         v2.addWidget(self.spin_step)
         settings_layout.addLayout(v2)
         v3 = QVBoxLayout()
-        v3.addWidget(QLabel("Échantillons disque"))
+        v3.addWidget(QLabel("Disk samples"))
         self.spin_samples = QSpinBox()
         self.spin_samples.setRange(4, 256)
         self.spin_samples.setSingleStep(4)
@@ -1000,28 +1228,39 @@ class MainWindow(QMainWindow):
         v3.addWidget(self.spin_samples)
         settings_layout.addLayout(v3)
         v4 = QVBoxLayout()
-        v4.addWidget(QLabel("Inverser signe"))
+        v4.addWidget(QLabel("Invert sign"))
         self.chk_invert = QCheckBox("Invert")
         v4.addWidget(self.chk_invert)
         v4.addStretch()
         settings_layout.addLayout(v4)
+        v_mode = QVBoxLayout()
+        v_mode.addWidget(QLabel("Mode"))
+        self.combo_mode = QComboBox()
+        self.combo_mode.addItem("VO — full sphere", "vo")
+        self.combo_mode.addItem("VOP — positive hemisphere", "vop")
+        self.combo_mode.addItem("VON — negative hemisphere", "von")
+        self.combo_mode.setToolTip("Openness measure: VO (full sphere), "
+                                   "VOP (positive hemisphere) or VON (negative hemisphere)")
+        self.combo_mode.currentIndexChanged.connect(self._on_vo_mode_changed)
+        v_mode.addWidget(self.combo_mode)
+        settings_layout.addLayout(v_mode)
         settings_layout.addStretch()
         root.addWidget(settings_box)
 
         # Export group
-        export_box = QGroupBox("Options d'export")
+        export_box = QGroupBox("Export options")
         export_layout = QHBoxLayout(export_box)
         export_layout.setSpacing(20)
         v_export = QVBoxLayout()
-        v_export.addWidget(QLabel("Mode d'export"))
+        v_export.addWidget(QLabel("Export mode"))
         self.combo_export = QComboBox()
-        self.combo_export.addItem("Couleurs de vertex", "vertex_colors")
+        self.combo_export.addItem("Vertex colors", "vertex_colors")
         self.combo_export.addItem("Texture UV", "texture_uv")
         self.combo_export.currentIndexChanged.connect(self._on_export_mode_changed)
         v_export.addWidget(self.combo_export)
         export_layout.addLayout(v_export)
         v_tex_size = QVBoxLayout()
-        v_tex_size.addWidget(QLabel("Taille texture"))
+        v_tex_size.addWidget(QLabel("Texture size"))
         self.combo_tex_size = QComboBox()
         self.combo_tex_size.addItem("1024x1024", 1024)
         self.combo_tex_size.addItem("2048x2048", 2048)
@@ -1031,7 +1270,7 @@ class MainWindow(QMainWindow):
         v_tex_size.addWidget(self.combo_tex_size)
         export_layout.addLayout(v_tex_size)
         v_tex_fmt = QVBoxLayout()
-        v_tex_fmt.addWidget(QLabel("Format texture"))
+        v_tex_fmt.addWidget(QLabel("Texture format"))
         self.combo_tex_fmt = QComboBox()
         self.combo_tex_fmt.addItem("PNG", ".png")
         self.combo_tex_fmt.addItem("JPEG", ".jpg")
@@ -1043,13 +1282,13 @@ class MainWindow(QMainWindow):
 
         # Run / Cancel
         run_row = QHBoxLayout()
-        self.btn_run = QPushButton("▶  Lancer le calcul")
+        self.btn_run = QPushButton("▶  Run computation")
         self.btn_run.setFixedHeight(38)
         font = self.btn_run.font(); font.setPointSize(11); font.setBold(True)
         self.btn_run.setFont(font)
         self.btn_run.clicked.connect(self._run)
         run_row.addWidget(self.btn_run)
-        self.btn_cancel = QPushButton("Annuler")
+        self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setFixedHeight(38)
         self.btn_cancel.setEnabled(False)
         self.btn_cancel.clicked.connect(self._cancel)
@@ -1065,7 +1304,7 @@ class MainWindow(QMainWindow):
         root.addWidget(self.progress)
 
         # Log
-        log_box = QGroupBox("Journal")
+        log_box = QGroupBox("Log")
         log_layout = QVBoxLayout(log_box)
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
@@ -1076,7 +1315,7 @@ class MainWindow(QMainWindow):
         # Status bar
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage(f"Prêt — {_BACKEND}")
+        self.status.showMessage(f"Ready — {_BACKEND}")
 
     def _detect_texture_size(self, path):
         try:
@@ -1107,8 +1346,8 @@ class MainWindow(QMainWindow):
 
     def _browse_input(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Ouvrir maillage", self.input_edit.text() or "",
-            "Maillages 3D (*.ply *.obj *.stl *.off *.glb *.gltf);;Tous (*.*)")
+            self, "Open mesh", self.input_edit.text() or "",
+            "3D Meshes (*.ply *.obj *.stl *.off *.glb *.gltf);;All (*.*)")
         if path:
             self.input_edit.setText(path)
             if self.combo_export.currentData() == "texture_uv":
@@ -1116,7 +1355,8 @@ class MainWindow(QMainWindow):
             if not self.output_edit.text():
                 base = os.path.splitext(path)[0]
                 is_tex = self.combo_export.currentData() == "texture_uv"
-                self.output_edit.setText(base + "_VO" + (self.combo_tex_fmt.currentData() if is_tex else ".ply"))
+                suffix = "_" + self.combo_mode.currentData().upper()
+                self.output_edit.setText(base + suffix + (self.combo_tex_fmt.currentData() if is_tex else ".ply"))
             self.btn_viewer.setEnabled(_PYQTGRAPH_OK)
             self.current_mesh_path = path
 
@@ -1124,61 +1364,72 @@ class MainWindow(QMainWindow):
         is_texture = self.combo_export.currentData() == "texture_uv"
         if is_texture:
             fmt = self.combo_tex_fmt.currentData()
-            filt = "PNG (*.png);;JPEG (*.jpg);;Tous (*.*)" if fmt == ".png" else "JPEG (*.jpg);;PNG (*.png);;Tous (*.*)"
-            path, _ = QFileDialog.getSaveFileName(self, "Texture de sortie", self.output_edit.text() or "", filt)
+            filt = "PNG (*.png);;JPEG (*.jpg);;All (*.*)" if fmt == ".png" else "JPEG (*.jpg);;PNG (*.png);;All (*.*)"
+            path, _ = QFileDialog.getSaveFileName(self, "Output texture", self.output_edit.text() or "", filt)
         else:
             path, _ = QFileDialog.getSaveFileName(
-                self, "Maillage de sortie", self.output_edit.text() or "",
-                "PLY (*.ply);;GLB (*.glb);;Tous (*.*)", "PLY (*.ply)")
+                self, "Output mesh", self.output_edit.text() or "",
+                "PLY (*.ply);;GLB (*.glb);;All (*.*)", "PLY (*.ply)")
         if path:
             self.output_edit.setText(path)
 
-    def _open_3d_viewer(self):
-        """Ouvrir la fenêtre de visualisation 3D."""
+    def _open_3d_viewer(self, path=None):
+        """Open the 3D visualization window."""
         if not _PYQTGRAPH_OK:
-            self._log("⚠ pyqtgraph requis pour la visualisation 3D")
+            self._log("⚠ pyqtgraph required for 3D visualization")
             return
-            
-        if not hasattr(self, 'current_mesh_path') or not self.current_mesh_path:
-            self._log("⚠ Veuillez d'abord charger un fichier mesh")
+
+        path = path or self.input_edit.text().strip() or self.current_mesh_path
+        if not path:
+            self._log("⚠ Please load a mesh file first")
             return
-            
+
         try:
-            # Charger le mesh
-            mesh = trimesh.load_mesh(self.current_mesh_path, process=False)
+            # Load the mesh
+            mesh = trimesh.load_mesh(path, process=False)
+            if isinstance(mesh, trimesh.Scene):
+                mesh = trimesh.util.concatenate(mesh.dump())
+            if isinstance(mesh, trimesh.PointCloud):
+                mesh = trimesh.Trimesh(vertices=np.asarray(mesh.vertices), process=False)
             if not isinstance(mesh, trimesh.Trimesh):
-                self._log("⚠ Le fichier n'est pas un mesh triangulaire simple")
+                self._log("⚠ The file is not a simple triangular mesh")
                 return
                 
-            # Créer et afficher la fenêtre 3D
-            if not hasattr(self, 'viewer_3d') or not self.viewer_3d.isVisible():
+            # Create and show the 3D window (single instance — the widget is
+            # hidden on close so its GL context, and the compiled shader
+            # programs bound to it, survive across reopens).
+            if not hasattr(self, 'viewer_3d'):
                 self.viewer_3d = MeshViewer3D(self)
-            
+
+            _reset_gl_shader_cache()
             self.viewer_3d.load_mesh(mesh)
             self.viewer_3d.show()
-            self._log(f"🔍 Visualisation 3D : {os.path.basename(self.current_mesh_path)} ({len(mesh.vertices)} vertices, {len(mesh.faces)} faces)")
+            self.viewer_3d.raise_()
+            self.viewer_3d.activateWindow()
+            self._log(f"🔍 3D view: {os.path.basename(path)} ({len(mesh.vertices)} vertices, {len(mesh.faces)} faces)")
             
         except Exception as e:
-            self._log(f"⚠ Erreur lors du chargement du mesh : {e}")
+            self._log(f"⚠ Error loading mesh: {e}")
 
     def _run(self):
         input_path  = self.input_edit.text().strip()
         output_path = self.output_edit.text().strip()
         if not input_path:
-            self._log("⚠ Veuillez sélectionner un fichier d'entrée."); return
+            self._log("⚠ Please select an input file."); return
         if not os.path.isfile(input_path):
-            self._log(f"⚠ Fichier introuvable : {input_path}"); return
+            self._log(f"⚠ File not found: {input_path}"); return
         if not output_path:
-            self._log("⚠ Veuillez définir un fichier de sortie."); return
+            self._log("⚠ Please set an output file."); return
 
         self.log_edit.clear()
         export_mode = self.combo_export.currentData()
-        self._log(f"Entrée  : {input_path}")
-        self._log(f"Sortie  : {output_path}")
-        self._log(f"Rayon   : {self.spin_radius.value()}  |  Pas : {self.spin_step.value()}  "
-                  f"|  Échantillons : {self.spin_samples.value()}  "
-                  f"|  Invert : {self.chk_invert.isChecked()}")
-        self._log(f"Backend : {_BACKEND}")
+        self._log(f"Input  : {input_path}")
+        self._log(f"Output : {output_path}")
+        self._log(f"Radius : {self.spin_radius.value()}  |  Step : {self.spin_step.value()}  "
+                  f"|  Samples : {self.spin_samples.value()}  "
+                  f"|  Invert : {self.chk_invert.isChecked()}  "
+                  f"|  Mode : {self.combo_mode.currentData()}")
+        self._log(f"Backend: {_BACKEND}")
         self._log("-" * 60)
         self._set_running(True)
 
@@ -1188,6 +1439,7 @@ class MainWindow(QMainWindow):
             radius=self.spin_radius.value(), voxel_step=self.spin_step.value(),
             n_disk=self.spin_samples.value(), invert=self.chk_invert.isChecked(),
             export_mode=export_mode, texture_size=texture_size, texture_format="",
+            vo_mode=self.combo_mode.currentData(),
         )
         self._thread = QThread()
         self._worker.moveToThread(self._thread)
@@ -1196,40 +1448,70 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._update_progress)
         self._worker.finished.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
+        self._worker.cancelled.connect(self._on_cancelled)
         self._worker.finished.connect(self._thread.quit)
         self._worker.error.connect(self._thread.quit)
+        self._worker.cancelled.connect(self._thread.quit)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
     def _cancel(self):
-        self._log("⚠ Annulation demandée — le calcul en cours se terminera normalement.")
+        if self._worker is not None:
+            self._worker.cancel()
+        self._log("⚠ Cancellation requested — aborting…")
         self.btn_cancel.setEnabled(False)
 
     def _on_finished(self):
         self._log("=" * 60)
-        self._log("✔ Calcul terminé avec succès.")
+        self._log("✔ Computation finished successfully.")
         self._set_running(False)
-        self.status.showMessage("Calcul terminé.")
+        self.status.showMessage("Computation finished.")
+        # Show the result in the 3D viewer (exported mesh in vertex colors
+        # mode, input mesh in texture mode — a texture has no 3D output).
+        if _PYQTGRAPH_OK:
+            if self.combo_export.currentData() == "texture_uv":
+                view_path = self.input_edit.text().strip()
+            else:
+                view_path = self.output_edit.text().strip()
+            self._open_3d_viewer(view_path)
 
     def _on_error(self, tb):
         self._log("=" * 60)
-        self._log("✖ ERREUR :\n" + tb)
+        self._log("✖ ERROR:\n" + tb)
         self._set_running(False)
-        self.status.showMessage("Erreur — voir le journal.")
+        self.status.showMessage("Error — see the log.")
+
+    def _on_cancelled(self):
+        self._log("=" * 60)
+        self._log("✖ Computation cancelled — nothing was exported.")
+        self._set_running(False)
+        self.status.showMessage("Cancelled.")
+
+    def _on_vo_mode_changed(self, *args):
+        """Keep the output filename suffix (_VO/_VOP/_VON) in sync with the mode."""
+        out = self.output_edit.text().strip()
+        if not out:
+            return
+        stem, ext = os.path.splitext(out)
+        for s in ("_VO", "_VOP", "_VON"):
+            if stem.upper().endswith(s):
+                stem = stem[:-len(s)]
+                break
+        self.output_edit.setText(stem + "_" + self.combo_mode.currentData().upper() + ext)
 
     def _on_export_mode_changed(self, index):
         is_texture = self.combo_export.currentData() == "texture_uv"
         self.combo_tex_size.setEnabled(is_texture)
         self.combo_tex_fmt.setEnabled(is_texture)
         if is_texture:
-            self.output_label.setText("Texture : ")
-            self.output_edit.setPlaceholderText("Fichier texture de sortie (.png, .jpg)")
+            self.output_label.setText("Texture: ")
+            self.output_edit.setPlaceholderText("Output texture file (.png, .jpg)")
             inp = self.input_edit.text().strip()
             if inp and os.path.isfile(inp):
                 self._apply_texture_size(inp)
         else:
-            self.output_label.setText("Sortie :  ")
-            self.output_edit.setPlaceholderText("Fichier de sortie (.ply)")
+            self.output_label.setText("Output: ")
+            self.output_edit.setPlaceholderText("Output file (.ply)")
         output_path = self.output_edit.text().strip()
         if output_path:
             base, ext = os.path.splitext(output_path)
@@ -1255,14 +1537,16 @@ class MainWindow(QMainWindow):
     def _about(self):
         from PyQt5.QtWidgets import QMessageBox
         QMessageBox.about(
-            self, "À propos",
-            "<b>VO-SDF GUI v4</b> — Cross-platform<br><br>"
-            "<b>Backends (auto-détectés) :</b><br>"
-            "• <b>Warp CUDA</b> : Windows/Linux NVIDIA GPU<br>"
-            "• <b>Warp CPU</b> : Mac Apple Silicon / tout OS<br>"
-            "• <b>Open3D</b> : fallback si Warp absent<br>"
-            "• <b>NumPy</b> : fallback ultime<br><br>"
-            "<b>Installation Mac :</b><br>"
+            self, "About",
+            "<b>OBSCURA3D</b> — Cross-platform<br><br>"
+            "<b>Modes:</b> VO · VOP · VON<br><br>"
+            "<b>Backends (auto-detected):</b><br>"
+            "• <b>Warp CUDA</b>: Windows/Linux NVIDIA GPU<br>"
+            "• <b>Warp CPU</b>: Mac Apple Silicon / any OS<br>"
+            "• <b>Open3D</b>: fallback if Warp is missing<br>"
+            "• <b>NumPy</b>: last resort fallback<br>"
+            "• <b>metal_hybrid</b>: reserved (Apple Silicon, opt-in)<br><br>"
+            "<b>Mac install:</b><br>"
             "<tt>pip install warp-lang open3d</tt>"
         )
 
@@ -1271,9 +1555,20 @@ class MainWindow(QMainWindow):
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _resource_path(relative):
+    """Absolute path to a bundled resource (PyInstaller-aware)."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setApplicationName("OBSCURA3D")
     app.setStyle("Fusion")
+    icon_file = "OBSCURA3D.ico" if sys.platform == "win32" else "OBSCURA3D_512x512.png"
+    icon_path = _resource_path(icon_file)
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
