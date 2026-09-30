@@ -11,6 +11,17 @@ Results can be exported as per-vertex colors (PLY) or baked into a UV
 texture (PNG). A shaded OpenGL viewer displays the result automatically
 after each computation.
 
+## Downloads
+
+Ready-to-use installers are published on the
+[GitHub releases page](https://github.com/Fabri-Momo/OBSCURA3D/releases):
+
+| Platform | Package |
+|----------|---------|
+| Windows x64 | `OBSCURA3D-<version>-win64.msi` (installer with license page and install-path selection) |
+| macOS Apple Silicon | `OBSCURA3D-macOS-Apple-Silicon.dmg` |
+| Linux x86_64 | `OBSCURA3D-<version>-linux-x86_64.tar.gz` |
+
 ## Origin
 
 OBSCURA3D derives from the following publication (a copy,
