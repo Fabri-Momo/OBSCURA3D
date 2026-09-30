@@ -18,6 +18,16 @@ import sys
 import os
 import platform
 import traceback
+
+# Frozen windowed builds (PyInstaller --windowed) have no console and
+# sys.stdout/sys.stderr are None. Some third-party libs (e.g. warp's
+# logger in warp-lang>=1.15) call sys.stdout.write() unconditionally and
+# would crash at import/init — redirect them to devnull.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
+
 import numpy as np
 import trimesh
 from PIL import Image
@@ -56,6 +66,7 @@ for _i, _arg in enumerate(sys.argv[1:]):
     if _arg == "--backend" and _i + 1 < len(sys.argv) - 1:
         _FORCE_BACKEND = sys.argv[_i + 2]
 
+_WARP_ERR = None
 try:
     import warp as wp
     wp.init()
@@ -65,8 +76,9 @@ try:
     else:
         _WP_DEVICE = "cpu"
         _BACKEND   = "warp_cpu"
-except Exception:
+except Exception as _e:
     wp = None
+    _WARP_ERR = str(_e)
 
 try:
     import open3d as o3d
@@ -1347,6 +1359,8 @@ class MainWindow(QMainWindow):
                   f"|  Invert : {self.chk_invert.isChecked()}  "
                   f"|  Mode : {self.combo_mode.currentData()}")
         self._log(f"Backend: {_BACKEND}")
+        if wp is None and _WARP_ERR:
+            self._log(f"Warp unavailable: {_WARP_ERR}")
         self._log("-" * 60)
         self._set_running(True)
 
