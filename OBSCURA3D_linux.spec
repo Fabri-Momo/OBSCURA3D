@@ -22,6 +22,15 @@ hiddenimports = []
 excludes = ['tkinter', 'obscura_kernels']
 
 
+def _safe_submodules(pkg_name):
+    """collect_submodules skipping packages that crash on headless builds
+    (Qt init in pyqtgraph.examples, jupyter deps, test suites)."""
+    return collect_submodules(
+        pkg_name,
+        filter=lambda n: not any(
+            p in n.split('.') for p in ('tests', 'test', 'examples', 'jupyter')))
+
+
 def _collect_ext_libs(pkg):
     """Collect compiled extensions (.pyd/.dll/.so/.dylib) of a package shipped
     as real source files - collect_dynamic_libs misses some of them."""
@@ -71,7 +80,7 @@ try:
     import open3d
     datas += collect_data_files('open3d')
     binaries += collect_dynamic_libs('open3d')
-    hiddenimports += collect_submodules('open3d')
+    hiddenimports += _safe_submodules('open3d')
     print("open3d: bundled")
 except ImportError:
     print("open3d not installed - Open3D backend disabled in the build")
@@ -79,13 +88,13 @@ except ImportError:
 try:
     import pyqtgraph
     datas += collect_data_files('pyqtgraph')
-    hiddenimports += collect_submodules('pyqtgraph')
+    hiddenimports += _safe_submodules('pyqtgraph')
 except ImportError:
     print("pyqtgraph not installed - 3D viewer disabled in the build")
 
 try:
     import OpenGL
-    hiddenimports += collect_submodules('OpenGL')
+    hiddenimports += _safe_submodules('OpenGL')
 except ImportError:
     pass
 
