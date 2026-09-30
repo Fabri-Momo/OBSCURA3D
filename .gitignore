@@ -5,3 +5,12 @@ __pycache__/
 *.jpeg
 *.png
 !OBSCURA3D_512x512.png
+
+# Build artifacts
+build/
+dist/
+build_msi/
+*.msi
+*.dmg
+*.tar.gz
+*.AppImage

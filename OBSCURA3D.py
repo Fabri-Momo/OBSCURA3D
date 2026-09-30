@@ -32,6 +32,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QObject
 from PyQt5.QtGui import QFont, QTextCursor, QIcon
 
+__version__ = "1.0.0"
+
 try:
     import pyqtgraph as pg
     import pyqtgraph.opengl as gl
@@ -103,113 +105,19 @@ if _FORCE_BACKEND in ("warp_cuda", "warp_cpu", "open3d", "numpy", "metal_hybrid"
 
 
 # ---------------------------------------------------------------------------
-# Warp kernels (defined only if Warp is available)
+# Warp kernels — live in obscura_kernels.py, a real .py file shipped as a data
+# file in frozen builds so inspect.getsource works (Warp/Numba need source).
 # ---------------------------------------------------------------------------
 
 if wp is not None:
-    @wp.kernel
-    def _wp_build_tangent_frames(
-        normals:   wp.array(dtype=wp.vec3),
-        t1_out:    wp.array(dtype=wp.vec3),
-        t2_out:    wp.array(dtype=wp.vec3),
-        valid_out: wp.array(dtype=wp.int32),
-    ):
-        tid = wp.tid()
-        normal = normals[tid]
-        n_len = wp.length(normal)
-        if n_len < 1.0e-12:
-            valid_out[tid] = wp.int32(0)
-            t1_out[tid]    = wp.vec3(0.0, 0.0, 0.0)
-            t2_out[tid]    = wp.vec3(0.0, 0.0, 0.0)
-            return
-        valid_out[tid] = wp.int32(1)
-        n   = normal / n_len
-        ref = wp.vec3(1.0, 0.0, 0.0)
-        if wp.abs(wp.dot(n, ref)) > 0.9:
-            ref = wp.vec3(0.0, 1.0, 0.0)
-        t1 = wp.normalize(wp.cross(n, ref))
-        t2 = wp.normalize(wp.cross(n, t1))
-        t1_out[tid] = t1
-        t2_out[tid] = t2
-
-    @wp.kernel
-    def _wp_vo_kernel(
-        mesh_id:    wp.uint64,
-        vertices:   wp.array(dtype=wp.vec3),
-        normals:    wp.array(dtype=wp.vec3),
-        t1_arr:     wp.array(dtype=wp.vec3),
-        t2_arr:     wp.array(dtype=wp.vec3),
-        valid_arr:  wp.array(dtype=wp.int32),
-        offsets:    wp.array(dtype=wp.vec3),
-        lin_out:    wp.array(dtype=wp.float32),
-        lout_out:   wp.array(dtype=wp.float32),
-        lin_pos_out:  wp.array(dtype=wp.float32),
-        lout_pos_out: wp.array(dtype=wp.float32),
-        lin_neg_out:  wp.array(dtype=wp.float32),
-        lout_neg_out: wp.array(dtype=wp.float32),
-        max_dist:   wp.float32,
-        voxel_step: wp.float32,
-        invert:     wp.int32,
-    ):
-        vid, oid = wp.tid()
-        if valid_arr[vid] == wp.int32(0):
-            return
-        p  = vertices[vid]
-        n  = wp.normalize(normals[vid])
-        t1 = t1_arr[vid]
-        t2 = t2_arr[vid]
-        off = offsets[oid]
-        q   = p + off[0] * t1 + off[1] * t2 + off[2] * n
-        query = wp.mesh_query_point_sign_winding_number(mesh_id, q, max_dist)
-        inside = float(0.0)
-        if query.result:
-            closest     = wp.mesh_eval_position(mesh_id, query.face, query.u, query.v)
-            signed_dist = query.sign * wp.length(q - closest)
-            inside = wp.clamp(0.5 - signed_dist / voxel_step, 0.0, 1.0)
-        if invert != wp.int32(0):
-            inside = 1.0 - inside
-        outside = 1.0 - inside
-        inside_volume  = inside  * voxel_step
-        outside_volume = outside * voxel_step
-        wp.atomic_add(lin_out,  vid, inside_volume)
-        wp.atomic_add(lout_out, vid, outside_volume)
-        if off[2] >= 0.0:
-            wp.atomic_add(lin_pos_out,  vid, inside_volume)
-            wp.atomic_add(lout_pos_out, vid, outside_volume)
-        if off[2] <= 0.0:
-            wp.atomic_add(lin_neg_out,  vid, inside_volume)
-            wp.atomic_add(lout_neg_out, vid, outside_volume)
-
-    @wp.kernel
-    def _wp_vo_finalize(
-        lin_arr:      wp.array(dtype=wp.float32),
-        lout_arr:     wp.array(dtype=wp.float32),
-        lin_pos_arr:  wp.array(dtype=wp.float32),
-        lout_pos_arr: wp.array(dtype=wp.float32),
-        lin_neg_arr:  wp.array(dtype=wp.float32),
-        lout_neg_arr: wp.array(dtype=wp.float32),
-        valid_arr:    wp.array(dtype=wp.int32),
-        vo_out:       wp.array(dtype=wp.float32),
-        mode:         wp.int32,
-    ):
-        tid = wp.tid()
-        if valid_arr[tid] == wp.int32(0):
-            vo_out[tid] = float(-1.0)
-            return
-        if mode == wp.int32(0):
-            lin  = lin_arr[tid]
-            lout = lout_arr[tid]
-            vo_out[tid] = lout / lin if lin > 0.0 else float(-1.0)
-        elif mode == wp.int32(1):
-            lin   = lin_pos_arr[tid]
-            lout  = lout_pos_arr[tid]
-            total = lin + lout
-            vo_out[tid] = lout / total if total > 0.0 else float(-1.0)
-        else:
-            lin   = lin_neg_arr[tid]
-            lout  = lout_neg_arr[tid]
-            total = lin + lout
-            vo_out[tid] = lin / total if total > 0.0 else float(-1.0)
+    try:
+        from obscura_kernels import (
+            _wp_build_tangent_frames, _wp_vo_kernel, _wp_vo_finalize)
+    except Exception:
+        print("WARNING: obscura_kernels.py not found — Warp backend disabled")
+        wp = None
+        if _BACKEND in ("warp_cuda", "warp_cpu"):
+            _BACKEND = "open3d" if _O3D_OK else "numpy"
 
 
 # ---------------------------------------------------------------------------
@@ -282,29 +190,14 @@ def _finalize_vo(lin, lout, lin_pos, lout_pos, lin_neg, lout_neg, valid, mode):
     return vo.astype(np.float32)
 
 
+# Numba rasterizer — also in obscura_kernels.py (same inspect.getsource reason)
 try:
-    import numba
-    from numba import njit, prange
-
-    @njit(parallel=True, cache=False, nogil=True)
-    def _rasterize_numba(au, av, bu, bv, cu, cv, v0, v1, v2, denom,
-                         c0, c1, r0, r1, result, covered, tex_w, tex_h):
-        F = len(au)
-        for i in prange(F):
-            d = denom[i]
-            for row in range(r0[i], r1[i] + 1):
-                for col in range(c0[i], c1[i] + 1):
-                    px = float(col); py = float(row)
-                    w0 = ((bv[i]-cv[i])*(px-cu[i]) + (cu[i]-bu[i])*(py-cv[i])) / d
-                    w1 = ((cv[i]-av[i])*(px-cu[i]) + (au[i]-cu[i])*(py-cv[i])) / d
-                    w2 = 1.0 - w0 - w1
-                    if w0 >= 0.0 and w1 >= 0.0 and w2 >= 0.0:
-                        result[row, col]  = w0*v0[i] + w1*v1[i] + w2*v2[i]
-                        covered[row, col] = np.uint8(1)
-
-    _NUMBA_OK = True
-    _NUMBA_ERR = ""
+    import obscura_kernels as _ok_mod
+    _rasterize_numba = getattr(_ok_mod, '_rasterize_numba', None)
+    _NUMBA_OK = getattr(_ok_mod, '_NUMBA_OK', False) and _rasterize_numba is not None
+    _NUMBA_ERR = getattr(_ok_mod, '_NUMBA_ERR', '')
 except Exception as _e:
+    _rasterize_numba = None
     _NUMBA_OK = False
     _NUMBA_ERR = str(_e)
 
@@ -1562,6 +1455,29 @@ def _resource_path(relative):
 
 
 if __name__ == "__main__":
+    # Headless sanity check for CI/builds: no QApplication, exits immediately
+    if "--smoke-test" in sys.argv:
+        print(f"OBSCURA3D {__version__} smoke test - backend={_BACKEND} "
+              f"wp_device={_WP_DEVICE} open3d={_O3D_OK} numba={_NUMBA_OK} "
+              f"pyqtgraph={_PYQTGRAPH_OK} metal={_METAL_OK}")
+        if not _NUMBA_OK:
+            print(f"  numba err: {_NUMBA_ERR}")
+        if wp is not None:
+            # Actually launch a kernel: verifies inspect.getsource works
+            # (JIT source access is broken in badly-packaged frozen builds)
+            _n = wp.array(np.array([[0.0, 0.0, 1.0]], dtype=np.float32),
+                          dtype=wp.vec3, device=_WP_DEVICE)
+            _t1 = wp.zeros(1, dtype=wp.vec3, device=_WP_DEVICE)
+            _t2 = wp.zeros(1, dtype=wp.vec3, device=_WP_DEVICE)
+            _vv = wp.zeros(1, dtype=wp.int32, device=_WP_DEVICE)
+            wp.launch(_wp_build_tangent_frames, dim=1,
+                      inputs=[_n, _t1, _t2, _vv], device=_WP_DEVICE)
+            wp.synchronize()
+            if _vv.numpy()[0] != 1:
+                raise RuntimeError("warp kernel smoke test failed")
+            print("  warp kernel launch OK")
+        print("OBSCURA3D smoke test PASSED")
+        sys.exit(0)
     app = QApplication(sys.argv)
     app.setApplicationName("OBSCURA3D")
     app.setStyle("Fusion")

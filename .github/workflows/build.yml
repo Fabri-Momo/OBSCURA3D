@@ -1,0 +1,176 @@
+name: Build desktop applications
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 (MSI)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Install WiX Toolset
+        run: choco install wixtoolset --yes --no-progress
+
+      - name: Build Windows application
+        run: python -m PyInstaller --noconfirm --clean OBSCURA3D_windows.spec
+
+      - name: Test Windows application
+        run: dist/OBSCURA3D/OBSCURA3D.exe --smoke-test
+
+      - name: Build MSI installer
+        run: |
+          $wixBin = Get-ChildItem "${env:ProgramFiles(x86)}\WiX Toolset*\bin" -Directory | Select-Object -First 1
+          if ($wixBin) { $env:PATH = "$($wixBin.FullName);$env:PATH" }
+          python build_msi.py
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBSCURA3D-Windows-x64
+          path: dist/OBSCURA3D-*-win64.msi
+          if-no-files-found: error
+
+  macos:
+    name: macOS Apple Silicon (DMG)
+    runs-on: macos-14
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
+      - name: Build macOS application
+        run: python -m PyInstaller --noconfirm --clean OBSCURA3D_mac.spec
+
+      - name: Test macOS application
+        run: dist/OBSCURA3D.app/Contents/MacOS/OBSCURA3D --smoke-test
+
+      - name: Create DMG
+        run: |
+          mkdir -p dist/dmg
+          cp -R dist/OBSCURA3D.app dist/dmg/
+          ln -s /Applications dist/dmg/Applications
+          hdiutil create -volname OBSCURA3D -srcfolder dist/dmg -ov -format UDZO dist/OBSCURA3D-macOS-Apple-Silicon.dmg
+
+      - name: Upload macOS installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBSCURA3D-macOS-Apple-Silicon
+          path: dist/OBSCURA3D-macOS-Apple-Silicon.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux x86_64 (tar.gz)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libgl1 libegl1 libxkbcommon0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build Linux application
+        run: python -m PyInstaller --noconfirm --clean OBSCURA3D_linux.spec
+
+      - name: Test Linux application
+        run: dist/OBSCURA3D/OBSCURA3D --smoke-test
+
+      - name: Create tarball
+        run: |
+          cp OBSCURA3D.desktop dist/OBSCURA3D/
+          VERSION=$(python -c "import re; print(re.search(r'__version__\s*=\s*[\"\']([^\"\']+)', open('OBSCURA3D.py').read()).group(1))")
+          tar -czf "dist/OBSCURA3D-${VERSION}-linux-x86_64.tar.gz" -C dist OBSCURA3D
+          ls -la dist/
+
+      - name: Upload Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: OBSCURA3D-Linux-x86_64
+          path: dist/OBSCURA3D-*-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [windows, macos, linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: OBSCURA3D-Windows-x64
+          path: dist
+
+      - name: Download macOS installer
+        uses: actions/download-artifact@v4
+        with:
+          name: OBSCURA3D-macOS-Apple-Silicon
+          path: dist
+
+      - name: Download Linux archive
+        uses: actions/download-artifact@v4
+        with:
+          name: OBSCURA3D-Linux-x86_64
+          path: dist
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          dist/*.msi dist/*.dmg dist/*.tar.gz
+          --repo "${{ github.repository }}"
+          --title "OBSCURA3D $GITHUB_REF_NAME"
+          --generate-notes
