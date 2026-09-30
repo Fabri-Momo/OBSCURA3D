@@ -38,6 +38,43 @@ sky visibility on 3D models of carved stones (Mongolian deer stones) and
 shows that **volumetric obscurance gives the best results** for revealing
 carved figures. If you use OBSCURA3D in your research, please cite it.
 
+## Usage
+
+1. **Launch** OBSCURA3D (installer shortcut, or `python OBSCURA3D.py`).
+2. **Files** — pick the input mesh (`Browse…` or File → Open mesh,
+   `Ctrl+O`). Any format readable by trimesh works: `.ply`, `.obj`,
+   `.stl`, `.glb`, `.off`… The output path is proposed automatically
+   (`<input>_<MODE>.ply` or the texture extension); change it via
+   `Browse…` or File → Set output (`Ctrl+S`).
+3. **Settings**
+   - **Radius (m)** — radius of the obscurance sphere around each vertex,
+     in mesh units. Default `0.01`. Larger radii smooth over bigger
+     features; keep it small relative to the mesh extent for carvings.
+   - **Step (m)** — sampling step along each ray, in mesh units.
+     Default `0.001`. Smaller = finer surface intersection, slower.
+   - **Disk samples** — number of ray directions sampled per vertex
+     (4–256, default 16). More samples = smoother result, slower.
+   - **Invert** — flip the inside/outside sign convention (use it if the
+     shading looks inverted on your mesh).
+   - **Mode** —
+     `VO` full sphere (default, classic volumetric obscurance),
+     `VOP` positive hemisphere along the surface normal (openness),
+     `VON` negative hemisphere (carved/concave parts).
+4. **Export options**
+   - **Vertex colors** — the output mesh is a `.ply` with the VO value
+     stored as per-vertex grayscale color (viewable in CloudCompare,
+     Meshlab, Blender…).
+   - **Texture UV** — VO is baked into an image texture (PNG or JPEG,
+     1024–4096 px, or the original texture size) for meshes with UVs.
+5. **Run computation** — progress and details appear in the log.
+   `Cancel` aborts cleanly (nothing is exported). When it finishes, the
+   shaded 3D viewer opens automatically on the result; you can also open
+   it anytime with **View 3D**.
+
+The mesh is cleaned automatically before computation (duplicate vertices
+merged, normals fixed, negative-volume meshes inverted). The status bar
+shows the compute backend actually used.
+
 ## Compute backends
 
 Auto-detected in this order:
