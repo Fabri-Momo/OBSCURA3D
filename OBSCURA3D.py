@@ -1281,13 +1281,18 @@ class MainWindow(QMainWindow):
             self.input_edit.setText(path)
             if self.combo_export.currentData() == "texture_uv":
                 self._apply_texture_size(path)
-            if not self.output_edit.text():
-                base = os.path.splitext(path)[0]
-                is_tex = self.combo_export.currentData() == "texture_uv"
-                suffix = "_" + self.combo_mode.currentData().upper()
-                self.output_edit.setText(base + suffix + (self.combo_tex_fmt.currentData() if is_tex else ".ply"))
+            self._suggest_output(path)
             self.btn_viewer.setEnabled(_PYQTGRAPH_OK)
             self.current_mesh_path = path
+
+    def _suggest_output(self, path):
+        """Propose an output filename next to the input, based on the
+        current VO mode and export mode."""
+        base = os.path.splitext(path)[0]
+        is_tex = self.combo_export.currentData() == "texture_uv"
+        ext = self.combo_tex_fmt.currentData() if is_tex else ".ply"
+        self.output_edit.setText(
+            base + "_" + self.combo_mode.currentData().upper() + ext)
 
     def _browse_output(self):
         is_texture = self.combo_export.currentData() == "texture_uv"
