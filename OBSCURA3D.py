@@ -830,6 +830,13 @@ def clean_mesh(mesh, log_fn=None, progress_fn=None):
     return mesh
 
 
+# Last cleaned mesh: (abspath, size, mtime_ns) -> trimesh.Trimesh.
+# Load+cleanup is expensive on multi-million-vertex meshes and depends only
+# on the file, not on compute parameters — reuse it across runs.
+_clean_mesh_key = None
+_clean_mesh_obj = None
+
+
 def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
                    export_mode, texture_size, texture_format, log_fn, progress_fn,
                    vo_mode="vo", cancel_fn=None):
@@ -842,15 +849,28 @@ def compute_vo_sdf(input_mesh, output_mesh, radius, voxel_step, n_disk, invert,
     if vo_mode not in ("vo", "vop", "von"):
         raise ValueError(f"vo_mode must be 'vo', 'vop' or 'von', got {vo_mode!r}")
     progress_fn(0)
-    mesh = trimesh.load_mesh(input_mesh, process=False)
-    
-    if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError("The file is not a simple triangular mesh.")
-    
-    # Systematic cleanup
-    mesh = clean_mesh(mesh, log_fn, progress_fn)
-    if not isinstance(mesh, trimesh.Trimesh):
-        raise ValueError("The file is not a simple triangular mesh.")
+
+    global _clean_mesh_key, _clean_mesh_obj
+    try:
+        st = os.stat(input_mesh)
+        key = (os.path.abspath(input_mesh), st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key == _clean_mesh_key and _clean_mesh_obj is not None:
+        mesh = _clean_mesh_obj.copy()
+        log_fn("Mesh unchanged — cleanup skipped (cached from previous run)")
+        progress_fn(10)
+    else:
+        mesh = trimesh.load_mesh(input_mesh, process=False)
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError("The file is not a simple triangular mesh.")
+
+        # Systematic cleanup
+        mesh = clean_mesh(mesh, log_fn, progress_fn)
+        if not isinstance(mesh, trimesh.Trimesh):
+            raise ValueError("The file is not a simple triangular mesh.")
+        _clean_mesh_key = key
+        _clean_mesh_obj = mesh.copy() if key is not None else None
 
     if export_mode == "texture_uv":
         uv_raw = _get_uv(mesh)
